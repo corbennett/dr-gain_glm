@@ -25,7 +25,7 @@ predictors entering as an offset. Iterate until gains stop moving.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, Sequence
+from typing import NamedTuple, Optional, Sequence
 
 import numpy as np
 from sklearn.linear_model import Lasso, LassoCV, Ridge, RidgeCV
@@ -178,6 +178,46 @@ def _design_block(series: np.ndarray, lags: np.ndarray,
             if absl < T:
                 L[: T - absl, i] = series[absl:]
     return L @ basis
+
+
+class TimeBins(NamedTuple):
+    """Container for an epoch's bin grid (returned by `make_time_bins`)."""
+    edges: np.ndarray   # (T+1,) bin boundaries: bin t covers [edges[t], edges[t+1])
+    centers: np.ndarray # (T,) bin centers: edges[:-1] + dt/2
+    T: int              # number of bins = floor((end - start) / dt)
+    dt: float           # bin width in seconds
+    start: float        # epoch start in seconds (= edges[0])
+    end: float          # epoch end requested (may exceed edges[-1] by < dt)
+
+
+def make_time_bins(start: float, end: float, dt: float) -> TimeBins:
+    """Build the bin grid for an epoch covering [start, end) at width `dt`.
+
+    `T = floor((end - start) / dt)`; bin `t` covers
+    `[start + t*dt, start + (t+1)*dt)`. If `end - start` isn't an exact
+    multiple of `dt`, the trailing partial bin is dropped (consistent with
+    `bin_spike_times` and the rest of the codebase, which always use
+    `np.floor` for bin counts).
+
+    Parameters
+    ----------
+    start, end : epoch start and end in seconds
+    dt         : bin width in seconds
+
+    Returns
+    -------
+    TimeBins with `.edges`, `.centers`, `.T`, `.dt`, `.start`, `.end`.
+    """
+    if end <= start:
+        raise ValueError(
+            f"end ({end}) must be greater than start ({start})")
+    if dt <= 0:
+        raise ValueError(f"dt must be positive, got {dt}")
+    T = int(np.floor((end - start) / dt))
+    edges = start + np.arange(T + 1) * dt
+    centers = edges[:-1] + dt / 2.0
+    return TimeBins(edges=edges, centers=centers, T=T, dt=dt,
+                    start=float(start), end=float(end))
 
 
 def bin_spike_times(spike_times: np.ndarray, start: float, end: float,
