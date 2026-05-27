@@ -146,6 +146,19 @@ def main():
     print(f"  remove V1+V2 : "
           f"{model.delta_r2(y, trial_idx, remove_gains=['V1','V2']):+.5f}")
 
+    print("\n=== Parameter fits ===")
+    fig = model.summary_plot(y)
+    fig2 = model.plot_fit(y, trial_idx)
+    try:
+        import matplotlib.pyplot as plt
+        fig.savefig("example_summary.png", dpi=120)
+        fig2.savefig("example_fit_snippet.png", dpi=120)
+        print("\nsaved kernel/PSTH summary to example_summary.png")
+        print("saved fit snippet to example_fit_snippet.png")
+        plt.show()
+    except Exception:
+        pass
+
 
 if __name__ == "__main__":
     main()

@@ -116,15 +116,31 @@ class EventPredictor:
 
 @dataclass
 class ContinuousPredictor:
-    """Dense regressor: arbitrary 1D signal sampled at the y bin grid, convolved
-    with a temporal kernel. To use as a spike-history term, pass values=y and
-    window=(dt, T_history)."""
+    """Dense regressor: arbitrary 1D signal convolved with a temporal kernel.
+
+    `values` is the signal. By default it must already be sampled at the y
+    bin grid (length T, same `dt`). If `times` is also supplied, the signal
+    is treated as (timestamps in seconds, value at each timestamp) and is
+    resampled onto the y bin grid at fit/predict time:
+
+    - `align="interp"` (default): linear interpolation at bin centers
+      (np.interp). Edge behavior: clamped to the first/last sample.
+      Best for smoothly-varying signals (velocity, calcium, BOLD).
+    - `align="bin"`: average all samples whose timestamps fall within
+      each bin (empty bins → 0). Best for already-discretised count-like
+      signals sampled densely.
+
+    To use as a spike-history term, pass values=y and window=(dt, T_history)
+    (the auto `spike_history` constructor option does this for you).
+    """
     name: str
-    values: np.ndarray           # length-T series at the same dt as y
+    values: np.ndarray           # signal: length-T at dt, or arbitrary length if `times` is set
     window: tuple
     n_basis: int = 8
     basis: str = "cosine"
     gain_modulated: bool = False
+    times: Optional[np.ndarray] = None   # optional sample timestamps in seconds (same clock as y)
+    align: str = "interp"                # "interp" | "bin" — resampling mode when `times` is set
 
 
 @dataclass
@@ -528,28 +544,107 @@ class BilinearGLM:
 
     # ----- design construction ----------------------------------------------
 
+    def _continuous_to_bins(self, values, T, *,
+                              times=None, align: str = "interp") -> np.ndarray:
+        """Resample a continuous signal onto the y bin grid.
+
+        If `times` is None, `values` must already be length T; any NaN
+        entries are linearly interpolated over (using surrounding finite
+        values; the nearest finite value is held constant at the edges).
+
+        Otherwise `(values, times)` are interpolated (`align="interp"`) or
+        averaged per bin (`align="bin"`) onto bins `[t*dt, (t+1)*dt)` for
+        t=0..T-1. Sample pairs where either `values` or `times` is NaN are
+        dropped before resampling. `times` is sorted defensively (np.interp
+        requires it).
+        """
+        arr = np.asarray(values, dtype=float).ravel()
+        if times is None:
+            if arr.size != T:
+                raise ValueError(
+                    f"continuous values have length {arr.size}, expected "
+                    f"T={T} (pass `times=` to resample irregularly-sampled "
+                    f"data onto the bin grid)")
+            nan_mask = np.isnan(arr)
+            if nan_mask.any():
+                if nan_mask.all():
+                    raise ValueError(
+                        "continuous values are all NaN — cannot interpolate")
+                idx = np.arange(T)
+                arr = np.where(nan_mask,
+                               np.interp(idx, idx[~nan_mask], arr[~nan_mask]),
+                               arr)
+            return arr
+        times_arr = np.asarray(times, dtype=float).ravel()
+        if times_arr.size != arr.size:
+            raise ValueError(
+                f"values and times must have the same length, got "
+                f"{arr.size} and {times_arr.size}")
+        valid = ~(np.isnan(arr) | np.isnan(times_arr))
+        if not valid.any():
+            raise ValueError(
+                "all (values, times) pairs are NaN — cannot resample")
+        arr = arr[valid]
+        times_arr = times_arr[valid]
+        if not np.all(np.diff(times_arr) >= 0):
+            order = np.argsort(times_arr)
+            arr = arr[order]
+            times_arr = times_arr[order]
+        if align == "interp":
+            bin_centers = (np.arange(T) + 0.5) * self.dt
+            return np.interp(bin_centers, times_arr, arr)
+        if align == "bin":
+            bin_idx = np.floor(times_arr / self.dt).astype(int)
+            in_range = (bin_idx >= 0) & (bin_idx < T)
+            bin_idx = bin_idx[in_range]
+            arr_v = arr[in_range]
+            sums = np.zeros(T)
+            counts = np.zeros(T, dtype=int)
+            np.add.at(sums, bin_idx, arr_v)
+            np.add.at(counts, bin_idx, 1)
+            out = np.zeros(T)
+            nz = counts > 0
+            out[nz] = sums[nz] / counts[nz]
+            return out
+        raise ValueError(
+            f"unknown align {align!r}, must be 'interp' or 'bin'")
+
     def _input_series(self, T: int, overrides: Optional[dict] = None):
-        """Return {pred_name: 1D series of length T} for every predictor."""
+        """Return {pred_name: 1D series of length T} for every predictor.
+
+        Continuous-predictor overrides may be either a length-T array
+        (already binned) or a (values, times) tuple that gets resampled onto
+        the bin grid using the predictor's `align` setting.
+        """
         out = {}
         ov = overrides or {}
         for p in self.predictors:
             if p.name in ov:
-                arr = np.asarray(ov[p.name], dtype=float).ravel()
+                val = ov[p.name]
                 if isinstance(p, EventPredictor):
+                    arr = np.asarray(val, dtype=float).ravel()
                     out[p.name] = _event_series(arr, self.dt, T)
                 else:
-                    if arr.size != T:
-                        raise ValueError(f"override for {p.name!r} has length "
-                                         f"{arr.size}, expected {T}")
-                    out[p.name] = arr
+                    if isinstance(val, tuple) and len(val) == 2:
+                        values, times = val
+                        out[p.name] = self._continuous_to_bins(
+                            values, T, times=times,
+                            align=getattr(p, "align", "interp"))
+                    else:
+                        arr = np.asarray(val, dtype=float).ravel()
+                        if arr.size != T:
+                            raise ValueError(
+                                f"override for {p.name!r} has length "
+                                f"{arr.size}, expected {T} (or pass a "
+                                f"(values, times) tuple to resample)")
+                        out[p.name] = arr
             elif isinstance(p, EventPredictor):
                 out[p.name] = _event_series(p.times, self.dt, T)
             else:
-                arr = np.asarray(p.values, dtype=float).ravel()
-                if arr.size != T:
-                    raise ValueError(f"continuous predictor {p.name!r} has "
-                                     f"length {arr.size}, expected T={T}")
-                out[p.name] = arr
+                out[p.name] = self._continuous_to_bins(
+                    p.values, T,
+                    times=getattr(p, "times", None),
+                    align=getattr(p, "align", "interp"))
         return out
 
     def _design_blocks(self, series: dict) -> dict:
@@ -1105,6 +1200,8 @@ class BilinearGLM:
             self._check_predictor_compat(p_new)
             if isinstance(p_new, EventPredictor):
                 overrides[p_new.name] = p_new.times
+            elif getattr(p_new, "times", None) is not None:
+                overrides[p_new.name] = (p_new.values, p_new.times)
             else:
                 overrides[p_new.name] = p_new.values
 
@@ -1190,62 +1287,412 @@ class BilinearGLM:
             out[p.name] = row
         return out
 
+    def psth(self, name: str, y: np.ndarray) -> Optional[np.ndarray]:
+        """Mean of `y` aligned to event times of predictor `name`.
+
+        Returns a 1D array on the same lag grid as `lags_seconds(name)`.
+        Events whose lag window falls outside `y`'s extent contribute NaN
+        at the out-of-range lags; the average is taken with `nanmean`.
+        Returns None if `name` isn't an EventPredictor.
+        """
+        p = self.predictors[self._pred_idx[name]]
+        if not isinstance(p, EventPredictor):
+            return None
+        y_arr = np.asarray(y, dtype=float).ravel()
+        T = y_arr.size
+        lags = self._lags[name]
+        if p.times is None or len(p.times) == 0:
+            return np.full(lags.size, np.nan)
+        bins = np.floor(np.asarray(p.times, dtype=float) / self.dt).astype(int)
+        idx = bins[:, None] + lags[None, :]
+        valid = (idx >= 0) & (idx < T)
+        snippets = np.where(valid, y_arr[np.clip(idx, 0, T - 1)], np.nan)
+        with np.errstate(invalid="ignore"):
+            return np.nanmean(snippets, axis=0)
+
+    def print_parameter_table(self) -> None:
+        """Print intercept, gain offsets/slopes, and kernel norms to stdout."""
+        if self.beta_ is None:
+            raise RuntimeError("call fit() first")
+        print(f"intercept: {self.intercept_:+.4f}")
+        if self._modulated:
+            print("\nGain-modulated predictors:")
+            all_vars = sorted({v for p in self._modulated
+                                 for v in self._gains_for[p.name]})
+            header = f"  {'predictor':<18}  {'offset':>10}"
+            for v in all_vars:
+                header += f"  {v:>10}"
+            header += f"  {'|K|2':>8}"
+            print(header)
+            for p in self._modulated:
+                row = (f"  {p.name:<18}  "
+                       f"{self.gain_offset(p.name):>+10.4f}")
+                for v in all_vars:
+                    if v in self._gains_for[p.name]:
+                        row += f"  {self.gain_coefficient(v, p.name):>+10.4f}"
+                    else:
+                        row += f"  {'—':>10}"
+                row += f"  {np.linalg.norm(self.kernel(p.name)):>8.4f}"
+                print(row)
+        non_mod = [p for p in self.predictors if not p.gain_modulated]
+        if non_mod:
+            print("\nNon-modulated predictors:")
+            print(f"  {'predictor':<18}  {'|K|2':>8}  {'max|K|':>8}")
+            for p in non_mod:
+                k = self.kernel(p.name)
+                print(f"  {p.name:<18}  {np.linalg.norm(k):>8.4f}  "
+                      f"{np.max(np.abs(k)):>8.4f}")
+        if self.history_:
+            last = self.history_[-1]
+            print(f"\nFinal regularization: "
+                  f"kernel_alpha={last['kernel_alpha']:.3g}  "
+                  f"gain_alpha={last['gain_alpha']:.3g}  "
+                  f"({len(self.history_)} ALS iterations)")
+
+    def summary_plot(self, y: Optional[np.ndarray] = None, *,
+                     axes=None, figsize=None,
+                     print_table: bool = True):
+        """Plot fitted kernels; overlay PSTHs of `y` on event-predictor axes.
+
+        One subplot per predictor. The kernel is drawn on the primary y-axis;
+        for EventPredictors, if `y` is given, the PSTH of `y` aligned to that
+        predictor's event times is drawn on a twin y-axis (red).
+
+        Parameters
+        ----------
+        y           : optional (T,) signal used to compute event-aligned PSTHs
+        axes        : optional flat sequence of matplotlib axes
+                      (one per predictor); if None, a new figure is created
+        figsize     : figsize for the new figure (auto if None)
+        print_table : if True, also prints the parameter-fits table
+
+        Returns the matplotlib Figure.
+        """
+        if self.beta_ is None:
+            raise RuntimeError("call fit() first")
+        import matplotlib.pyplot as plt
+
+        n_pred = len(self.predictors)
+        if axes is None:
+            ncols = min(n_pred, 3)
+            nrows = int(np.ceil(n_pred / ncols))
+            if figsize is None:
+                figsize = (4.2 * ncols, 3.0 * nrows)
+            fig, ax_arr = plt.subplots(nrows, ncols, figsize=figsize,
+                                        squeeze=False)
+            ax_list = ax_arr.ravel().tolist()
+        else:
+            ax_list = list(np.atleast_1d(axes).ravel())
+            if len(ax_list) < n_pred:
+                raise ValueError(
+                    f"need >= {n_pred} axes, got {len(ax_list)}")
+            fig = ax_list[0].figure
+
+        y_arr = (np.asarray(y, dtype=float).ravel()
+                 if y is not None else None)
+
+        for i, p in enumerate(self.predictors):
+            ax = ax_list[i]
+            lags_sec = self.lags_seconds(p.name)
+            kernel = self.kernel(p.name)
+            ax.plot(lags_sec, kernel, color="C0", lw=1.5, label="kernel")
+            ax.axhline(0, color="k", lw=0.5, alpha=0.4)
+            ax.axvline(0, color="k", lw=0.5, alpha=0.4)
+            ax.set_xlabel("lag (s)")
+            ax.set_ylabel("kernel", color="C0")
+            ax.tick_params(axis="y", labelcolor="C0")
+            tag = " (gain)" if p.gain_modulated else ""
+            ax.set_title(f"{p.name}{tag}")
+
+            if isinstance(p, EventPredictor) and y_arr is not None:
+                psth = self.psth(p.name, y_arr)
+                if psth is not None and np.isfinite(psth).any():
+                    ax2 = ax.twinx()
+                    ax2.plot(lags_sec, psth, color="C3", lw=1.2,
+                             alpha=0.8, label="PSTH")
+                    ax2.set_ylabel("y (PSTH)", color="C3")
+                    ax2.tick_params(axis="y", labelcolor="C3")
+
+        for ax in ax_list[n_pred:]:
+            ax.set_visible(False)
+
+        fig.tight_layout()
+        if print_table:
+            self.print_parameter_table()
+        return fig
+
+    def plot_fit(self, y: np.ndarray, trial_idx: np.ndarray, *,
+                 fraction: float = 1.0 / 3.0, start: int = 0,
+                 show_events: bool = True, show_gains: bool = True,
+                 show_continuous: bool = True,
+                 ax=None, figsize=None):
+        """Plot a snippet of `y` with the full-model prediction overlaid.
+
+        Parameters
+        ----------
+        y, trial_idx : as in `fit()`. The prediction uses the in-sample
+                       `predict_fitted` (i.e. fit-time predictors and gains).
+        fraction     : portion of T to show (default 1/3). Ignored if the
+                       resulting window has zero length.
+        start        : starting bin index (default 0).
+        show_events  : if True, mark EventPredictor times falling within the
+                       snippet as raster ticks at the top of the y/model panel.
+        show_gains   : if True (and the model has gain-modulated predictors
+                       and `ax` is not supplied), add a panel below the
+                       y/model trace showing g_p(t) = offset + Σ slope·V(t)
+                       for each gain-modulated predictor, with a dashed line
+                       at the offset.
+        show_continuous : if True (and there are ContinuousPredictors other
+                       than the auto spike-history series, and `ax` is not
+                       supplied), add a final panel showing each continuous
+                       predictor's input series over the snippet.
+        ax           : optional matplotlib axes; if None, a new figure is made.
+                       If supplied, only the y/model panel is drawn.
+        figsize      : figsize for the new figure (auto if None).
+
+        Returns the matplotlib Figure.
+        """
+        if self.beta_ is None:
+            raise RuntimeError("call fit() first")
+        import matplotlib.pyplot as plt
+
+        y_arr = np.asarray(y, dtype=float).ravel()
+        T = y_arr.size
+        trial_idx = np.asarray(trial_idx, dtype=int).ravel()
+        if not 0.0 < fraction <= 1.0:
+            raise ValueError(f"fraction must be in (0, 1], got {fraction}")
+        if not 0 <= start < T:
+            raise ValueError(f"start must be in [0, T={T}), got {start}")
+        stop = min(T, start + max(1, int(np.floor(fraction * T))))
+
+        yhat = self.predict_fitted(y_arr, trial_idx)
+        t_axis = np.arange(start, stop) * self.dt
+
+        continuous_preds = [p for p in self.predictors
+                            if isinstance(p, ContinuousPredictor)
+                            and p.name != self._history_predictor_name]
+        want_gain_panel = (ax is None and show_gains
+                           and len(self._modulated) > 0
+                           and len(self.gains) > 0)
+        want_cont_panel = (ax is None and show_continuous
+                           and len(continuous_preds) > 0)
+
+        ax_g = None
+        ax_c = None
+        if ax is None:
+            heights = [3.0]
+            roles = ["main"]
+            if want_gain_panel:
+                heights.append(1.5)
+                roles.append("gain")
+            if want_cont_panel:
+                heights.append(1.5)
+                roles.append("cont")
+            if figsize is None:
+                figsize = (12, 3.5 + 1.5 * (len(roles) - 1))
+            fig, ax_arr = plt.subplots(
+                len(roles), 1, figsize=figsize, sharex=True,
+                gridspec_kw={"height_ratios": heights}, squeeze=False)
+            ax_arr = ax_arr.ravel()
+            ax = ax_arr[0]
+            if "gain" in roles:
+                ax_g = ax_arr[roles.index("gain")]
+            if "cont" in roles:
+                ax_c = ax_arr[roles.index("cont")]
+            bottom_ax = ax_arr[-1]
+        else:
+            fig = ax.figure
+            bottom_ax = ax
+
+        ax.plot(t_axis, y_arr[start:stop], color="k", lw=0.8,
+                alpha=0.6, label="y")
+        ax.plot(t_axis, yhat[start:stop], color="C3", lw=1.2,
+                label="model")
+        ax.set_ylabel("y")
+        ax.set_title(f"fit snippet (bins {start}:{stop} of {T})")
+
+        if show_events:
+            t_lo, t_hi = start * self.dt, stop * self.dt
+            event_preds = [p for p in self.predictors
+                           if isinstance(p, EventPredictor)
+                           and p.times is not None]
+            n_evt = len(event_preds)
+            # one raster row per event predictor, stacked just above the data
+            for row, p in enumerate(event_preds):
+                times = np.asarray(p.times, dtype=float)
+                times = times[(times >= t_lo) & (times < t_hi)]
+                if times.size == 0:
+                    continue
+                color = f"C{(self.predictors.index(p) % 9) + 1}"
+                # ymin/ymax in axis coords: top ~8% of the plot, split into rows
+                band_lo = 1.0 - 0.08 * (row + 1) / max(n_evt, 1)
+                band_hi = 1.0 - 0.08 * row / max(n_evt, 1)
+                for ti, t in enumerate(times):
+                    ax.axvline(t, ymin=band_lo, ymax=band_hi,
+                                color=color, lw=0.8, alpha=0.9,
+                                label=p.name if ti == 0 else None)
+
+        ax.legend(loc="best", fontsize=9, framealpha=0.9)
+
+        if ax_g is not None:
+            gain_t_full = self._gain_per_t(T, trial_idx)
+            for p in self._modulated:
+                offset = self.gain_offset(p.name)
+                g_t = np.full(stop - start, offset)
+                for vname in self._gains_for[p.name]:
+                    slope = self.gain_coefficient(vname, p.name)
+                    g_t = g_t + slope * gain_t_full[vname][start:stop]
+                color = f"C{(self.predictors.index(p) % 9) + 1}"
+                ax_g.plot(t_axis, g_t, color=color, lw=1.0, label=p.name)
+                ax_g.axhline(offset, color=color, lw=0.6, ls="--",
+                              alpha=0.5)
+            ax_g.axhline(0, color="k", lw=0.5, alpha=0.3)
+            ax_g.set_ylabel("gain $g_p(t)$")
+            ax_g.legend(loc="best", fontsize=9, framealpha=0.9, ncol=2)
+
+        if ax_c is not None:
+            for p in continuous_preds:
+                k = self.predictors.index(p)
+                color = f"C{(k % 9) + 1}"
+                series = self._continuous_to_bins(
+                    p.values, T,
+                    times=getattr(p, "times", None),
+                    align=getattr(p, "align", "interp"))
+                ax_c.plot(t_axis, series[start:stop], color=color, lw=0.9,
+                           label=p.name)
+            ax_c.axhline(0, color="k", lw=0.5, alpha=0.3)
+            ax_c.set_ylabel("continuous")
+            ax_c.legend(loc="best", fontsize=9, framealpha=0.9, ncol=2)
+
+        bottom_ax.set_xlabel("time (s)")
+
+        fig.tight_layout()
+        return fig
+
     # ----- nested model comparison -----------------------------------------
 
     def delta_r2(self, y: np.ndarray, trial_idx: np.ndarray, *,
                  remove_gains: Sequence[str] = (),
                  remove_predictors: Sequence[str] = (),
-                 fit_mask: Optional[np.ndarray] = None) -> float:
-        """ΔR² = R²(full) - R²(reduced).
+                 fit_mask: Optional[np.ndarray] = None,
+                 n_folds: int = 5, gap_history=False,
+                 max_iter: int = 100, tol: float = 1e-3,
+                 patience: int = 3, verbose: bool = False) -> float:
+        """Cross-validated ΔR² = R²(full) - R²(reduced) on held-out test trials.
 
-        Reduced model zeros out specified value-gain coefficients (for every
-        predictor they modulate) and/or whole predictor blocks. Kernels and
-        gain offsets are not refit; this matches the paper's "kernels held at
-        the final iteration; only the targeted gains are removed" comparison
-        when used after fit().
+        Trials are partitioned into `n_folds` contiguous groups (same scheme
+        as `cross_val_score`). For each fold the full model is refit on
+        training trials; the reduced model is obtained by zeroing the
+        specified value-gain coefficients and/or whole predictor blocks from
+        the fold's fitted parameters (kernels and gain offsets are NOT refit
+        under the null — matches the paper's "kernels held at the final
+        iteration; only the targeted gains are removed" comparison). Both
+        predictions are then evaluated on the held-out test bins.
 
-        If `fit_mask` is given (or one was stored at fit time), R² is computed
-        only over masked bins.
+        If `fit_mask` is given (or one was stored at fit time), both training
+        and test rows are restricted to its True bins. `gap_history` works
+        as in `cross_val_score`.
+
+        Returns the mean ΔR² across folds; per-fold values are stored in
+        `self.cv_delta_r2_`.
+
+        Does NOT update `self.beta_` / `self.gain_` / `self.intercept_`.
         """
-        if self.beta_ is None:
-            raise RuntimeError("call fit() first")
-        if fit_mask is None:
-            fit_mask = self.fit_mask_
-
         y_arr = np.asarray(y, dtype=float).ravel()
         T = y_arr.size
-        full_yhat = self.predict_fitted(y_arr, trial_idx)
-        beta = self.beta_.copy()
-        gain = self.gain_.copy()
-        for vname in remove_gains:
-            for p in self._modulated:
-                key = (vname, p.name)
-                if key in self._gain_var_idx:
-                    gain[self._gain_var_idx[key]] = 0.0
-        for pname in remove_predictors:
-            k = self._pred_idx[pname]
-            beta[self._beta_off[k]:self._beta_off[k + 1]] = 0.0
-        # build reduced prediction
+        trial_idx = np.asarray(trial_idx, dtype=int).ravel()
+        if trial_idx.size != T:
+            raise ValueError("trial_idx must have the same length as y")
+
+        if fit_mask is None:
+            fit_mask = self.fit_mask_
+        if fit_mask is not None:
+            eval_mask = np.asarray(fit_mask, dtype=bool).ravel()
+            if eval_mask.size != T:
+                raise ValueError(
+                    f"fit_mask must have length T={T}, got {eval_mask.size}")
+        else:
+            eval_mask = np.ones(T, dtype=bool)
+
+        if gap_history:
+            if self._history_predictor_name is None:
+                raise ValueError(
+                    "gap_history requires spike_history to be configured "
+                    "on the model")
+            if gap_history is True:
+                gap_bins = int(self._lags[self._history_predictor_name].max())
+            else:
+                gap_bins = int(gap_history)
+        else:
+            gap_bins = 0
+
         series = self._input_series(T,
                                     overrides=self._with_history(None, y_arr))
         blocks = self._design_blocks(series)
         gain_t = self._gain_per_t(T, trial_idx)
-        red_yhat = self._predict_from_state(blocks, gain_t, beta, gain,
-                                             self.intercept_)
-        if fit_mask is not None:
-            m = np.asarray(fit_mask, dtype=bool).ravel()
-            if m.size != T:
-                raise ValueError(
-                    f"fit_mask must have length T={T}, got {m.size}")
-            y_arr = y_arr[m]
-            full_yhat = full_yhat[m]
-            red_yhat = red_yhat[m]
-        ss_tot = float(np.sum((y_arr - y_arr.mean()) ** 2))
-        if ss_tot == 0.0:
-            return float("nan")
-        r2_full = 1.0 - float(np.sum((y_arr - full_yhat) ** 2)) / ss_tot
-        r2_red = 1.0 - float(np.sum((y_arr - red_yhat) ** 2)) / ss_tot
-        return r2_full - r2_red
+
+        trials = np.unique(trial_idx)
+        folds = np.array_split(trials, n_folds)
+
+        deltas = []
+        for fold_i, test_trials in enumerate(folds):
+            train_trials = np.setdiff1d(trials, test_trials)
+            train_in_fold = np.isin(trial_idx, train_trials)
+            test_in_fold = np.isin(trial_idx, test_trials)
+            if gap_bins > 0:
+                train_in_fold = self._safe_under_history(train_in_fold,
+                                                         gap_bins)
+                test_in_fold = self._safe_under_history(test_in_fold,
+                                                        gap_bins)
+            train_mask = train_in_fold & eval_mask
+            test_mask = test_in_fold & eval_mask
+
+            y_tr = y_arr[train_mask]
+            blocks_tr = {k: v[train_mask] for k, v in blocks.items()}
+            gain_t_tr = {k: v[train_mask] for k, v in gain_t.items()}
+
+            if verbose:
+                print(f"\n=== ΔR² CV fold {fold_i + 1}/{n_folds} "
+                      f"({test_mask.sum()} test bins, "
+                      f"{train_mask.sum()} train bins"
+                      + (f", gap={gap_bins}" if gap_bins else "")
+                      + ") ===")
+
+            beta, gain_vec, b0, _ = self._fit_als(
+                y_tr, blocks_tr, gain_t_tr,
+                max_iter=max_iter, tol=tol, patience=patience, verbose=verbose,
+            )
+
+            beta_red = beta.copy()
+            gain_red = gain_vec.copy()
+            for vname in remove_gains:
+                for p in self._modulated:
+                    key = (vname, p.name)
+                    if key in self._gain_var_idx:
+                        gain_red[self._gain_var_idx[key]] = 0.0
+            for pname in remove_predictors:
+                k = self._pred_idx[pname]
+                beta_red[self._beta_off[k]:self._beta_off[k + 1]] = 0.0
+
+            y_te = y_arr[test_mask]
+            blocks_te = {k: v[test_mask] for k, v in blocks.items()}
+            gain_t_te = {k: v[test_mask] for k, v in gain_t.items()}
+            full_yhat = self._predict_from_state(
+                blocks_te, gain_t_te, beta, gain_vec, b0)
+            red_yhat = self._predict_from_state(
+                blocks_te, gain_t_te, beta_red, gain_red, b0)
+            ss_tot = float(np.sum((y_te - y_te.mean()) ** 2))
+            if ss_tot == 0.0:
+                deltas.append(float("nan"))
+                continue
+            r2_full = 1.0 - float(np.sum((y_te - full_yhat) ** 2)) / ss_tot
+            r2_red = 1.0 - float(np.sum((y_te - red_yhat) ** 2)) / ss_tot
+            deltas.append(r2_full - r2_red)
+            if verbose:
+                print(f"  fold {fold_i + 1} ΔR²={deltas[-1]:+.4f}")
+
+        self.cv_delta_r2_ = np.array(deltas)
+        return float(np.nanmean(self.cv_delta_r2_))
 
     # ----- pseudosession permutation test -----------------------------------
 

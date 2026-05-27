@@ -257,12 +257,15 @@ These run every fit / predict call to build the per-bin design.
 | [gain_offset(name)](bilinear_glm.py#L660) | Scalar gain offset $\beta^g_{0,p}$. |
 | [gain_coefficient(gain_name, pred_name)](bilinear_glm.py#L663) | Scalar slope $\beta^g_{v,p}$. |
 | [gain_table()](bilinear_glm.py#L666) | Nested `{pred: {"offset": ..., gain_var: ...}}` for inspection. |
+| [psth(name, y)](bilinear_glm.py#L666) | Event-triggered mean of `y` on the kernel's lag grid (None for non-event predictors). |
+| [print_parameter_table()](bilinear_glm.py#L666) | Print intercept, gain offsets/slopes, and kernel norms to stdout. |
+| [summary_plot(y=None)](bilinear_glm.py#L666) | One subplot per predictor with the fitted kernel; overlay event-triggered PSTH of `y` on EventPredictor axes. |
 
 #### Statistical comparisons
 
 | Method | What it does |
 |---|---|
-| [delta_r2](bilinear_glm.py#L678) | ΔR² between the full fitted model and a reduced model that zeros out specified gain slopes and/or whole predictor blocks. Kernels and offsets are **not** refit — this matches the paper's "kernels held at the final iteration; only the targeted gains are removed" comparison. |
+| [delta_r2](bilinear_glm.py#L678) | Cross-validated ΔR² between the full and reduced model on held-out test trials. For each fold the full model is refit on training trials; the reduced model zeros out specified gain slopes and/or whole predictor blocks from the fold's fitted parameters (kernels and offsets are **not** refit under the null — matches the paper's "kernels held at the final iteration; only the targeted gains are removed" comparison). Both predictions are scored on the test bins. |
 | [pseudosession_test](bilinear_glm.py#L718) | Circular-shift permutation test for a single gain variable. Holds kernels and intercept fixed at fitted values; refits only the gain coefficients for the real and shifted gain series; reports the observed ΔR² and the empirical p-value against the null distribution of shifts. |
 | [_delta_r2_remove](bilinear_glm.py#L771) | Internal helper used by `pseudosession_test`. Refits gain coefficients on a column-removed copy of the gain design and returns the resulting ΔR². |
 
@@ -331,9 +334,10 @@ wasteful and unstable.
 
 Two ways to test whether a gain variable matters:
 
-**`delta_r2`** is a simple drop-one comparison: how much $R^2$ does the
-full model lose if we zero out the slopes for gain $v$ (or the whole
-block of predictor $p$)? Cheap, deterministic, no refit.
+**`delta_r2`** is a cross-validated drop-one comparison: how much
+held-out $R^2$ does the full model lose if we zero out the slopes for
+gain $v$ (or the whole block of predictor $p$) from each fold's fitted
+parameters? Kernels and offsets are not refit under the null.
 
 $$
 \Delta R^2 = R^2_{\text{full}} - R^2_{\text{reduced}}
