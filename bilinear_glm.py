@@ -130,6 +130,25 @@ class ContinuousPredictor:
       each bin (empty bins → 0). Best for already-discretised count-like
       signals sampled densely.
 
+    `normalize` is applied to the binned series before it enters the
+    regression (and before plotting in `plot_fit`). It makes kernels on
+    different-unit predictors comparable and gives ridge / lasso penalties a
+    consistent meaning across predictors. Computed per call from the
+    current bin series — at predict time with new data, the stats are
+    re-derived from that new data, so for strict ML hygiene either keep
+    `normalize="none"` and z-score the input yourself with stored fit-time
+    stats, or only predict on the same session.
+
+    - `"none"` (default): no rescaling.
+    - `"center"`: subtract the mean.
+    - `"zscore"`: subtract the mean, divide by std (degenerate-std → center).
+
+    `outlier_zscore` rejects samples whose absolute z-score (computed on the
+    raw values, ignoring existing NaNs) exceeds the threshold. Rejected
+    samples are set to NaN and then either linearly interpolated over (the
+    length-T path) or dropped before resampling (the (values, times) path).
+    Default 5.0; pass `None` to disable.
+
     To use as a spike-history term, pass values=y and window=(dt, T_history)
     (the auto `spike_history` constructor option does this for you).
     """
@@ -141,6 +160,20 @@ class ContinuousPredictor:
     gain_modulated: bool = False
     times: Optional[np.ndarray] = None   # optional sample timestamps in seconds (same clock as y)
     align: str = "interp"                # "interp" | "bin" — resampling mode when `times` is set
+    normalize: str = "none"              # "none" | "center" | "zscore" — applied to the binned series
+    outlier_zscore: Optional[float] = 5.0  # |z| > threshold → NaN before resampling/interp; None to disable
+
+
+def _is_event(p) -> bool:
+    """Predictor-kind check by class name. Robust to module / class reloads
+    (`isinstance` compares class identity, which breaks when the module is
+    re-executed in an interactive session — old objects keep pointing at the
+    previous class object). Comparing by class name survives reloads."""
+    return type(p).__name__ == "EventPredictor"
+
+
+def _is_continuous(p) -> bool:
+    return type(p).__name__ == "ContinuousPredictor"
 
 
 @dataclass
@@ -472,6 +505,9 @@ class BilinearGLM:
                 name=h_name, values=np.zeros(1),
                 window=h_window, n_basis=h_n_basis, basis=h_basis,
                 gain_modulated=h_gain_modulated,
+                # y itself is the input here — leave its values untouched so
+                # legitimate peaks (bursts, transients) aren't clipped.
+                outlier_zscore=None,
             ))
             self._history_predictor_name = h_name
 
@@ -479,7 +515,7 @@ class BilinearGLM:
         self.kernel_regularizer = kernel_regularizer
         self.kernel_alpha = kernel_alpha
         self.gain_alpha = gain_alpha
-        self.alphas = (np.logspace(-5, 5, 51) if alphas is None
+        self.alphas = (np.logspace(-5, 5, 21) if alphas is None
                        else np.asarray(alphas, dtype=float))
         # None  → RidgeCV uses efficient SVD-based leave-one-out (GCV) — fast
         # int   → k-fold CV (required for LassoCV; Ridge will use joblib, slow)
@@ -545,7 +581,10 @@ class BilinearGLM:
     # ----- design construction ----------------------------------------------
 
     def _continuous_to_bins(self, values, T, *,
-                              times=None, align: str = "interp") -> np.ndarray:
+                              times=None, align: str = "interp",
+                              normalize: str = "none",
+                              outlier_zscore: Optional[float] = 5.0,
+                              ) -> np.ndarray:
         """Resample a continuous signal onto the y bin grid.
 
         If `times` is None, `values` must already be length T; any NaN
@@ -557,8 +596,16 @@ class BilinearGLM:
         t=0..T-1. Sample pairs where either `values` or `times` is NaN are
         dropped before resampling. `times` is sorted defensively (np.interp
         requires it).
+
+        `outlier_zscore`: if set, samples whose |z| (computed on the raw
+        finite values) exceeds the threshold are marked NaN before the
+        NaN-handling step. None disables.
+
+        `normalize` is applied to the binned series: "none" (default),
+        "center" (subtract mean), or "zscore" (subtract mean, divide by std).
         """
         arr = np.asarray(values, dtype=float).ravel()
+        arr = self._mark_outliers(arr, outlier_zscore)
         if times is None:
             if arr.size != T:
                 raise ValueError(
@@ -574,7 +621,7 @@ class BilinearGLM:
                 arr = np.where(nan_mask,
                                np.interp(idx, idx[~nan_mask], arr[~nan_mask]),
                                arr)
-            return arr
+            return self._normalise_continuous(arr, normalize)
         times_arr = np.asarray(times, dtype=float).ravel()
         if times_arr.size != arr.size:
             raise ValueError(
@@ -592,8 +639,8 @@ class BilinearGLM:
             times_arr = times_arr[order]
         if align == "interp":
             bin_centers = (np.arange(T) + 0.5) * self.dt
-            return np.interp(bin_centers, times_arr, arr)
-        if align == "bin":
+            out = np.interp(bin_centers, times_arr, arr)
+        elif align == "bin":
             bin_idx = np.floor(times_arr / self.dt).astype(int)
             in_range = (bin_idx >= 0) & (bin_idx < T)
             bin_idx = bin_idx[in_range]
@@ -605,23 +652,121 @@ class BilinearGLM:
             out = np.zeros(T)
             nz = counts > 0
             out[nz] = sums[nz] / counts[nz]
-            return out
+        else:
+            raise ValueError(
+                f"unknown align {align!r}, must be 'interp' or 'bin'")
+        return self._normalise_continuous(out, normalize)
+
+    @staticmethod
+    def _mark_outliers(arr: np.ndarray,
+                        threshold: Optional[float],
+                        max_passes: int = 5) -> np.ndarray:
+        """Return a copy of arr with robust |z| > threshold set to NaN.
+
+        Uses median + MAD (median absolute deviation) instead of mean + std,
+        so the outliers themselves can't inflate the scale enough to hide
+        each other — a known failure mode of iterated mean/std thresholding
+        (e.g., 5% outliers at ±100 in N(0,1) give a std of ~22, making the
+        outliers' z only ~4.5, so a threshold of 5 misses them entirely).
+
+        Robust z = (x − median) / (1.4826 · MAD), where the 1.4826 makes
+        MAD consistent with std under a normal distribution. Iterates up
+        to `max_passes` for stability; with MAD a single pass is usually
+        sufficient.
+        """
+        if threshold is None or threshold <= 0:
+            return arr
+        out = arr.astype(float, copy=True)
+        for _ in range(max_passes):
+            finite = np.isfinite(out)
+            if int(finite.sum()) < 2:
+                break
+            finite_vals = out[finite]
+            med = float(np.median(finite_vals))
+            mad = float(np.median(np.abs(finite_vals - med)))
+            if mad >= 1e-12:
+                scale = 1.4826 * mad
+            else:
+                # Degenerate MAD (e.g., > half the values are equal) — fall
+                # back to std so we still flag truly extreme points.
+                sd = float(np.std(finite_vals))
+                if sd < 1e-12:
+                    break
+                scale = sd
+            z = np.abs((out - med) / scale)
+            new_outliers = finite & (z > threshold)
+            if not new_outliers.any():
+                break
+            out[new_outliers] = np.nan
+        return out
+
+    def _continuous_used_mask(self, values, T, *,
+                                times=None, align: str = "interp",
+                                outlier_zscore: Optional[float] = 5.0,
+                                ) -> np.ndarray:
+        """Return a (T,) bool mask: True at bins whose value derives from
+        an actual original sample (not from outlier replacement, NaN fill,
+        empty-bin zero, or out-of-range edge clamping).
+
+        Useful for plotting: setting `series[~mask] = NaN` hides synthetic
+        fill values so only "real" data is shown.
+        """
+        arr = np.asarray(values, dtype=float).ravel()
+        arr = self._mark_outliers(arr, outlier_zscore)
+        if times is None:
+            if arr.size != T:
+                return np.zeros(T, dtype=bool)
+            return ~np.isnan(arr)
+        times_arr = np.asarray(times, dtype=float).ravel()
+        if times_arr.size != arr.size:
+            return np.zeros(T, dtype=bool)
+        valid = ~(np.isnan(arr) | np.isnan(times_arr))
+        if not valid.any():
+            return np.zeros(T, dtype=bool)
+        valid_times = times_arr[valid]
+        if align == "bin":
+            bin_idx = np.floor(valid_times / self.dt).astype(int)
+            in_range = (bin_idx >= 0) & (bin_idx < T)
+            mask = np.zeros(T, dtype=bool)
+            mask[bin_idx[in_range]] = True
+            return mask
+        # align == "interp": bins inside the range of valid samples derive
+        # their value from real data; outside, np.interp clamps to the edge
+        # which is synthetic.
+        bin_centers = (np.arange(T) + 0.5) * self.dt
+        t_lo, t_hi = float(valid_times.min()), float(valid_times.max())
+        return (bin_centers >= t_lo) & (bin_centers <= t_hi)
+
+    @staticmethod
+    def _normalise_continuous(arr: np.ndarray, mode: str) -> np.ndarray:
+        if mode == "none":
+            return arr
+        if mode == "center":
+            return arr - float(np.mean(arr))
+        if mode == "zscore":
+            mu = float(np.mean(arr))
+            sd = float(np.std(arr))
+            if sd < 1e-12:
+                return arr - mu
+            return (arr - mu) / sd
         raise ValueError(
-            f"unknown align {align!r}, must be 'interp' or 'bin'")
+            f"unknown normalize {mode!r}, must be 'none', 'center', or 'zscore'")
 
     def _input_series(self, T: int, overrides: Optional[dict] = None):
         """Return {pred_name: 1D series of length T} for every predictor.
 
         Continuous-predictor overrides may be either a length-T array
-        (already binned) or a (values, times) tuple that gets resampled onto
-        the bin grid using the predictor's `align` setting.
+        (already binned — fed through the predictor's `normalize` step
+        only; assumed not to need resampling) or a (values, times) tuple
+        that gets resampled and normalised onto the bin grid using the
+        predictor's `align` / `normalize` settings.
         """
         out = {}
         ov = overrides or {}
         for p in self.predictors:
             if p.name in ov:
                 val = ov[p.name]
-                if isinstance(p, EventPredictor):
+                if _is_event(p):
                     arr = np.asarray(val, dtype=float).ravel()
                     out[p.name] = _event_series(arr, self.dt, T)
                 else:
@@ -629,7 +774,10 @@ class BilinearGLM:
                         values, times = val
                         out[p.name] = self._continuous_to_bins(
                             values, T, times=times,
-                            align=getattr(p, "align", "interp"))
+                            align=getattr(p, "align", "interp"),
+                            normalize=getattr(p, "normalize", "none"),
+                            outlier_zscore=getattr(
+                                p, "outlier_zscore", 5.0))
                     else:
                         arr = np.asarray(val, dtype=float).ravel()
                         if arr.size != T:
@@ -637,14 +785,22 @@ class BilinearGLM:
                                 f"override for {p.name!r} has length "
                                 f"{arr.size}, expected {T} (or pass a "
                                 f"(values, times) tuple to resample)")
-                        out[p.name] = arr
-            elif isinstance(p, EventPredictor):
+                        # Route through _continuous_to_bins to apply the
+                        # predictor's outlier / normalize settings consistently.
+                        out[p.name] = self._continuous_to_bins(
+                            arr, T,
+                            normalize=getattr(p, "normalize", "none"),
+                            outlier_zscore=getattr(
+                                p, "outlier_zscore", 5.0))
+            elif _is_event(p):
                 out[p.name] = _event_series(p.times, self.dt, T)
             else:
                 out[p.name] = self._continuous_to_bins(
                     p.values, T,
                     times=getattr(p, "times", None),
-                    align=getattr(p, "align", "interp"))
+                    align=getattr(p, "align", "interp"),
+                    normalize=getattr(p, "normalize", "none"),
+                    outlier_zscore=getattr(p, "outlier_zscore", 5.0))
         return out
 
     def _design_blocks(self, series: dict) -> dict:
@@ -792,6 +948,14 @@ class BilinearGLM:
         kernel_alpha = self.kernel_alpha
         gain_alpha = self.gain_alpha
 
+        # Inner-loop solvers are hoisted out so we can reuse them across
+        # iterations. For Lasso, `warm_start=True` lets coordinate descent
+        # initialise from the previous iteration's beta — usually 2–3× faster
+        # than a cold restart since the kernels change only modestly between
+        # ALS sweeps. Ridge has a closed-form solve, so reuse is cosmetic.
+        kernel_solver = None
+        gain_solver = None
+
         var_indices = [self._gain_var_idx[(v, p)]
                        for (v, p) in self._gain_var_idx]
         prev_gain_vars = (gain_vec[var_indices].copy()
@@ -810,11 +974,18 @@ class BilinearGLM:
                     beta = cv.coef_.copy()
                     b0 = float(cv.intercept_)
                 else:
-                    m = Lasso(alpha=kernel_alpha, fit_intercept=True,
-                              max_iter=10_000)
-                    m.fit(X, y)
-                    beta = m.coef_.copy()
-                    b0 = float(m.intercept_)
+                    if kernel_solver is None:
+                        kernel_solver = Lasso(alpha=kernel_alpha,
+                                               fit_intercept=True,
+                                               max_iter=10_000,
+                                               warm_start=True)
+                        # Seed with the previous iter's beta so the first
+                        # post-CV fit also benefits from a warm start.
+                        kernel_solver.coef_ = beta.copy()
+                        kernel_solver.intercept_ = float(b0)
+                    kernel_solver.fit(X, y)
+                    beta = kernel_solver.coef_.copy()
+                    b0 = float(kernel_solver.intercept_)
             elif self.kernel_regularizer == "ridge":
                 if kernel_alpha is None:
                     cv = RidgeCV(alphas=self.alphas, cv=self.cv_folds,
@@ -824,16 +995,23 @@ class BilinearGLM:
                     beta = cv.coef_.copy()
                     b0 = float(cv.intercept_)
                 else:
-                    m = Ridge(alpha=kernel_alpha, fit_intercept=True)
-                    m.fit(X, y)
-                    beta = m.coef_.copy()
-                    b0 = float(m.intercept_)
+                    if kernel_solver is None:
+                        kernel_solver = Ridge(alpha=kernel_alpha,
+                                               fit_intercept=True)
+                    kernel_solver.fit(X, y)
+                    beta = kernel_solver.coef_.copy()
+                    b0 = float(kernel_solver.intercept_)
             else:
                 raise ValueError(f"unknown kernel_regularizer "
                                  f"{self.kernel_regularizer!r}")
 
             # ---- step 2: normalise kernels & rescale gain offsets ----------
             self._normalise_kernels(beta, gain_vec)
+            # Keep the warm-start solver's internal coef in sync with the
+            # normalised beta — otherwise the next iter restarts from the
+            # un-normalised previous beta and pays back the rescaling.
+            if kernel_solver is not None and hasattr(kernel_solver, "coef_"):
+                kernel_solver.coef_ = beta.copy()
 
             # ---- step 3: gains | kernels -----------------------------------
             drives = self._kernel_drives(blocks, beta)
@@ -853,9 +1031,11 @@ class BilinearGLM:
                     gain_alpha = float(cv.alpha_)
                     gain_vec = cv.coef_.copy()
                 else:
-                    m = Ridge(alpha=gain_alpha, fit_intercept=False)
-                    m.fit(Z, target)
-                    gain_vec = m.coef_.copy()
+                    if gain_solver is None:
+                        gain_solver = Ridge(alpha=gain_alpha,
+                                             fit_intercept=False)
+                    gain_solver.fit(Z, target)
+                    gain_vec = gain_solver.coef_.copy()
 
             # ---- bookkeeping -----------------------------------------------
             yhat = self._predict_from_state(blocks, gain_t, beta, gain_vec, b0)
@@ -881,8 +1061,82 @@ class BilinearGLM:
 
         return beta, gain_vec, b0, history
 
+    def precompute_design(self, trial_idx: np.ndarray, *,
+                            T: Optional[int] = None) -> dict:
+        """Build the design blocks and per-bin gain values that are shared
+        across cells fit on the same session.
+
+        Returns a dict with:
+          blocks : {pred_name: (T, n_basis) design block}, omitting the
+                   spike-history predictor (which depends on each cell's y)
+          gain_t : {gain_name: (T,) per-bin gain modulator values}
+          T      : number of bins (for validation)
+
+        Pass this dict to ``fit(... design=...)`` or
+        ``fit_summary(... design=...)`` to skip the per-cell design build.
+        Saves the (T·n_lag·basis) convolution work that's otherwise repeated
+        per cell — most useful for Ridge fits where it's ~25% of per-cell
+        time. For Lasso the inner solver dominates so caching saves little.
+
+        If `spike_history` is configured, the history block is rebuilt per
+        cell from that cell's y (since y is itself the history input).
+        """
+        trial_idx = np.asarray(trial_idx, dtype=int).ravel()
+        if T is None:
+            T = trial_idx.size
+        elif trial_idx.size != T:
+            raise ValueError(
+                f"trial_idx length {trial_idx.size} != T={T}")
+
+        # Build series for every predictor except the auto spike-history
+        # (its values depend on the cell's y and are filled in per fit).
+        series = {}
+        for p in self.predictors:
+            if p.name == self._history_predictor_name:
+                continue
+            if _is_event(p):
+                series[p.name] = _event_series(p.times, self.dt, T)
+            else:
+                series[p.name] = self._continuous_to_bins(
+                    p.values, T,
+                    times=getattr(p, "times", None),
+                    align=getattr(p, "align", "interp"),
+                    normalize=getattr(p, "normalize", "none"),
+                    outlier_zscore=getattr(p, "outlier_zscore", 5.0))
+
+        blocks = {p.name: _design_block(series[p.name],
+                                          self._lags[p.name],
+                                          self._basis[p.name])
+                  for p in self.predictors
+                  if p.name != self._history_predictor_name}
+        gain_t = self._gain_per_t(T, trial_idx)
+        return {"blocks": blocks, "gain_t": gain_t, "T": T}
+
+    def _resolve_design(self, y: np.ndarray, T: int,
+                          trial_idx: np.ndarray,
+                          design: Optional[dict]):
+        """Return (blocks, gain_t) using the precomputed `design` if given,
+        else building from scratch. If spike_history is on, its block is
+        always built fresh from `y` (since y is its input)."""
+        if design is None:
+            series = self._input_series(
+                T, overrides=self._with_history(None, y))
+            return self._design_blocks(series), self._gain_per_t(T, trial_idx)
+        if design.get("T") != T:
+            raise ValueError(
+                f"precomputed design has T={design.get('T')}, got T={T}")
+        blocks = dict(design["blocks"])  # shallow copy so we can add history
+        gain_t = design["gain_t"]
+        if self._history_predictor_name is not None:
+            h = self._history_predictor_name
+            blocks[h] = _design_block(
+                np.asarray(y, dtype=float).ravel(),
+                self._lags[h], self._basis[h])
+        return blocks, gain_t
+
     def fit(self, y: np.ndarray, trial_idx: np.ndarray, *,
             fit_mask: Optional[np.ndarray] = None,
+            design: Optional[dict] = None,
             max_iter: int = 100, tol: float = 1e-3,
             patience: int = 3, verbose: bool = False):
         """Alternating-least-squares fit of the bilinear model.
@@ -903,6 +1157,9 @@ class BilinearGLM:
             without trial-edge kernel leakage. Stored as `self.fit_mask_`
             and reused as the default by `score`, `predict_*`,
             `cross_val_score`, `delta_r2`, and `pseudosession_test`.
+        design    : optional dict returned by ``precompute_design`` — when
+            fitting many cells on the same session, building the design
+            once and passing it here skips the per-cell convolution step.
 
         Convergence: every value gain coef changes by <= `tol` for `patience`
         consecutive iterations, or `max_iter` reached.
@@ -913,9 +1170,7 @@ class BilinearGLM:
         if trial_idx.size != T:
             raise ValueError("trial_idx must have the same length as y")
 
-        series = self._input_series(T, overrides=self._with_history(None, y))
-        blocks = self._design_blocks(series)
-        gain_t = self._gain_per_t(T, trial_idx)
+        blocks, gain_t = self._resolve_design(y, T, trial_idx, design)
 
         if fit_mask is not None:
             m = np.asarray(fit_mask, dtype=bool).ravel()
@@ -1054,6 +1309,203 @@ class BilinearGLM:
         self.cv_scores_ = np.array(cv_scores)
         return float(np.nanmean(self.cv_scores_))
 
+    def fit_summary(self, y: np.ndarray, trial_idx: np.ndarray, *,
+                     remove_gains: Sequence[str] = (),
+                     remove_predictors: Sequence[str] = (),
+                     fit_mask: Optional[np.ndarray] = None,
+                     design: Optional[dict] = None,
+                     n_folds: int = 5, gap_history=False,
+                     max_iter: int = 100, tol: float = 1e-3,
+                     patience: int = 3, verbose: bool = False) -> dict:
+        """Fit + in-sample R² + CV R² + ΔR² in one shared pass.
+
+        Equivalent to calling ``fit``, ``score``, ``cross_val_score``, and
+        ``delta_r2`` separately, but does roughly half the work: the design
+        matrix is built once, and the same five fold-fits power both the CV
+        R² and the ΔR² (the full and reduced predictions are scored on the
+        same held-out test bins).
+
+        For one cell with default 5-fold CV:
+          - separate calls: 4 design builds + 11 ALS fits
+          - fit_summary:    1 design build  + 6 ALS fits
+
+        After this method returns, the model is fitted on the full training
+        data (``self.beta_``, ``self.gain_``, ``self.intercept_`` are set),
+        so further inspection / prediction works as usual.
+
+        Parameters
+        ----------
+        y, trial_idx : as in ``fit``.
+        remove_gains, remove_predictors : as in ``delta_r2``. If both are
+            empty, the ΔR² fields of the returned dict are None.
+        fit_mask, n_folds, gap_history : as in ``cross_val_score``.
+        design : optional precomputed design dict (see
+            ``precompute_design``). When fitting many cells against the
+            same session, build it once and pass it here to skip the
+            per-cell design construction.
+        max_iter, tol, patience, verbose : as in ``fit``.
+
+        Returns
+        -------
+        dict with keys:
+          train_r2          : in-sample R² of the full model.
+          cv_r2             : mean held-out R² across folds.
+          cv_r2_per_fold    : (n_folds,) array of per-fold R².
+          delta_r2          : mean held-out ΔR² (or None).
+          delta_r2_per_fold : (n_folds,) array (or None).
+          kernels           : {pred_name: time-domain kernel array}.
+          gain_table        : as ``gain_table()``.
+          intercept         : scalar intercept b0.
+          n_iter            : ALS iterations used by the full-data fit
+                              (== max_iter means convergence wasn't reached).
+          n_iter_per_fold   : (n_folds,) array of ALS iterations per fold.
+          converged         : True iff the full-data fit converged before
+                              hitting max_iter.
+        """
+        y_arr = np.asarray(y, dtype=float).ravel()
+        T = y_arr.size
+        trial_idx = np.asarray(trial_idx, dtype=int).ravel()
+        if trial_idx.size != T:
+            raise ValueError("trial_idx must have the same length as y")
+
+        if fit_mask is not None:
+            mask = np.asarray(fit_mask, dtype=bool).ravel()
+            if mask.size != T:
+                raise ValueError(
+                    f"fit_mask must have length T={T}, got {mask.size}")
+        else:
+            mask = None
+        eval_mask = mask if mask is not None else np.ones(T, dtype=bool)
+
+        if gap_history:
+            if self._history_predictor_name is None:
+                raise ValueError(
+                    "gap_history requires spike_history to be configured "
+                    "on the model")
+            gap_bins = (int(self._lags[self._history_predictor_name].max())
+                        if gap_history is True else int(gap_history))
+        else:
+            gap_bins = 0
+
+        # Build design ONCE — shared across full fit, in-sample R², all folds.
+        # If `design` was supplied (precompute_design output), use it and only
+        # rebuild the history block from this cell's y.
+        blocks, gain_t = self._resolve_design(y_arr, T, trial_idx, design)
+
+        # --- full-data fit (replaces fit()) ----------------------------------
+        if mask is not None:
+            y_fit = y_arr[mask]
+            blocks_fit = {k: v[mask] for k, v in blocks.items()}
+            gain_t_fit = {k: v[mask] for k, v in gain_t.items()}
+        else:
+            y_fit, blocks_fit, gain_t_fit = y_arr, blocks, gain_t
+        self.fit_mask_ = mask
+        (self.beta_, self.gain_, self.intercept_,
+         self.history_) = self._fit_als(
+            y_fit, blocks_fit, gain_t_fit,
+            max_iter=max_iter, tol=tol, patience=patience, verbose=verbose)
+
+        # --- in-sample R² (replaces score()) — reuses the already-built design
+        yhat = self._predict_from_state(
+            blocks, gain_t, self.beta_, self.gain_, self.intercept_)
+        y_in = y_arr[eval_mask]
+        yhat_in = yhat[eval_mask]
+        ss_tot_in = float(np.sum((y_in - y_in.mean()) ** 2))
+        train_r2 = (1.0 - float(np.sum((y_in - yhat_in) ** 2)) / ss_tot_in
+                    if ss_tot_in > 0 else float("nan"))
+
+        # --- CV pass: full R² and (optional) ΔR² in the same folds ----------
+        compute_delta = bool(remove_gains) or bool(remove_predictors)
+        trials = np.unique(trial_idx)
+        folds = np.array_split(trials, n_folds)
+        cv_r2 = []
+        cv_delta = [] if compute_delta else None
+        n_iter_per_fold = []
+
+        for fold_i, test_trials in enumerate(folds):
+            train_trials = np.setdiff1d(trials, test_trials)
+            train_in_fold = np.isin(trial_idx, train_trials)
+            test_in_fold = np.isin(trial_idx, test_trials)
+            if gap_bins > 0:
+                train_in_fold = self._safe_under_history(
+                    train_in_fold, gap_bins)
+                test_in_fold = self._safe_under_history(
+                    test_in_fold, gap_bins)
+            train_mask = train_in_fold & eval_mask
+            test_mask = test_in_fold & eval_mask
+
+            y_tr = y_arr[train_mask]
+            blocks_tr = {k: v[train_mask] for k, v in blocks.items()}
+            gain_t_tr = {k: v[train_mask] for k, v in gain_t.items()}
+
+            if verbose:
+                print(f"\n=== fold {fold_i + 1}/{n_folds} "
+                      f"({test_mask.sum()} test bins, "
+                      f"{train_mask.sum()} train bins"
+                      + (f", gap={gap_bins}" if gap_bins else "")
+                      + ") ===")
+
+            beta, gain_vec, b0, fold_history = self._fit_als(
+                y_tr, blocks_tr, gain_t_tr,
+                max_iter=max_iter, tol=tol, patience=patience,
+                verbose=verbose)
+            n_iter_per_fold.append(len(fold_history))
+
+            y_te = y_arr[test_mask]
+            blocks_te = {k: v[test_mask] for k, v in blocks.items()}
+            gain_t_te = {k: v[test_mask] for k, v in gain_t.items()}
+            full_yhat = self._predict_from_state(
+                blocks_te, gain_t_te, beta, gain_vec, b0)
+            ss_tot = float(np.sum((y_te - y_te.mean()) ** 2))
+            if ss_tot == 0.0:
+                cv_r2.append(float("nan"))
+                if cv_delta is not None:
+                    cv_delta.append(float("nan"))
+                continue
+            r2_full = 1.0 - float(np.sum((y_te - full_yhat) ** 2)) / ss_tot
+            cv_r2.append(r2_full)
+
+            if compute_delta:
+                beta_red = beta.copy()
+                gain_red = gain_vec.copy()
+                for vname in remove_gains:
+                    for p in self._modulated:
+                        key = (vname, p.name)
+                        if key in self._gain_var_idx:
+                            gain_red[self._gain_var_idx[key]] = 0.0
+                for pname in remove_predictors:
+                    k = self._pred_idx[pname]
+                    beta_red[
+                        self._beta_off[k]:self._beta_off[k + 1]] = 0.0
+                red_yhat = self._predict_from_state(
+                    blocks_te, gain_t_te, beta_red, gain_red, b0)
+                r2_red = 1.0 - float(np.sum(
+                    (y_te - red_yhat) ** 2)) / ss_tot
+                cv_delta.append(r2_full - r2_red)
+
+        cv_r2_arr = np.array(cv_r2)
+        cv_delta_arr = (np.array(cv_delta)
+                        if cv_delta is not None else None)
+        self.cv_scores_ = cv_r2_arr
+        if cv_delta_arr is not None:
+            self.cv_delta_r2_ = cv_delta_arr
+
+        return {
+            "train_r2": train_r2,
+            "cv_r2": float(np.nanmean(cv_r2_arr)),
+            "cv_r2_per_fold": cv_r2_arr,
+            "delta_r2": (float(np.nanmean(cv_delta_arr))
+                         if cv_delta_arr is not None else None),
+            "delta_r2_per_fold": cv_delta_arr,
+            "kernels": {p.name: self.kernel(p.name)
+                        for p in self.predictors},
+            "gain_table": self.gain_table(),
+            "intercept": float(self.intercept_),
+            "n_iter": len(self.history_),
+            "n_iter_per_fold": np.array(n_iter_per_fold),
+            "converged": len(self.history_) < max_iter,
+        }
+
     def _predict_from_state(self, blocks, gain_t, beta, gain_vec, b0):
         T = next(iter(blocks.values())).shape[0]
         drives = self._kernel_drives(blocks, beta)
@@ -1074,7 +1526,7 @@ class BilinearGLM:
         if p_new.name not in self._pred_idx:
             raise ValueError(f"unknown predictor {p_new.name!r}")
         p_orig = self.predictors[self._pred_idx[p_new.name]]
-        if type(p_new) is not type(p_orig):
+        if type(p_new).__name__ != type(p_orig).__name__:
             raise ValueError(
                 f"predictor {p_new.name!r}: type mismatch "
                 f"({type(p_new).__name__} vs fitted "
@@ -1198,7 +1650,7 @@ class BilinearGLM:
         overrides: dict = {}
         for p_new in predictors:
             self._check_predictor_compat(p_new)
-            if isinstance(p_new, EventPredictor):
+            if _is_event(p_new):
                 overrides[p_new.name] = p_new.times
             elif getattr(p_new, "times", None) is not None:
                 overrides[p_new.name] = (p_new.values, p_new.times)
@@ -1296,7 +1748,7 @@ class BilinearGLM:
         Returns None if `name` isn't an EventPredictor.
         """
         p = self.predictors[self._pred_idx[name]]
-        if not isinstance(p, EventPredictor):
+        if not _is_event(p):
             return None
         y_arr = np.asarray(y, dtype=float).ravel()
         T = y_arr.size
@@ -1404,7 +1856,7 @@ class BilinearGLM:
             tag = " (gain)" if p.gain_modulated else ""
             ax.set_title(f"{p.name}{tag}")
 
-            if isinstance(p, EventPredictor) and y_arr is not None:
+            if _is_event(p) and y_arr is not None:
                 psth = self.psth(p.name, y_arr)
                 if psth is not None and np.isfinite(psth).any():
                     ax2 = ax.twinx()
@@ -1469,7 +1921,7 @@ class BilinearGLM:
         t_axis = np.arange(start, stop) * self.dt
 
         continuous_preds = [p for p in self.predictors
-                            if isinstance(p, ContinuousPredictor)
+                            if _is_continuous(p)
                             and p.name != self._history_predictor_name]
         want_gain_panel = (ax is None and show_gains
                            and len(self._modulated) > 0
@@ -1514,7 +1966,7 @@ class BilinearGLM:
         if show_events:
             t_lo, t_hi = start * self.dt, stop * self.dt
             event_preds = [p for p in self.predictors
-                           if isinstance(p, EventPredictor)
+                           if _is_event(p)
                            and p.times is not None]
             n_evt = len(event_preds)
             # one raster row per event predictor, stacked just above the data
@@ -1557,9 +2009,17 @@ class BilinearGLM:
                 series = self._continuous_to_bins(
                     p.values, T,
                     times=getattr(p, "times", None),
-                    align=getattr(p, "align", "interp"))
-                ax_c.plot(t_axis, series[start:stop], color=color, lw=0.9,
-                           label=p.name)
+                    align=getattr(p, "align", "interp"),
+                    normalize=getattr(p, "normalize", "none"),
+                    outlier_zscore=getattr(p, "outlier_zscore", 5.0))
+                used = self._continuous_used_mask(
+                    p.values, T,
+                    times=getattr(p, "times", None),
+                    align=getattr(p, "align", "interp"),
+                    outlier_zscore=getattr(p, "outlier_zscore", 5.0))
+                series_plot = np.where(used, series, np.nan)
+                ax_c.plot(t_axis, series_plot[start:stop], color=color,
+                           lw=0.9, label=p.name)
             ax_c.axhline(0, color="k", lw=0.5, alpha=0.3)
             ax_c.set_ylabel("continuous")
             ax_c.legend(loc="best", fontsize=9, framealpha=0.9, ncol=2)
