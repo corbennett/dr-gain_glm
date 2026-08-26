@@ -24,7 +24,7 @@ predictors entering as an offset. Iterate until gains stop moving.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import NamedTuple, Optional, Sequence
 
 import numpy as np
@@ -185,6 +185,15 @@ class GainModulator:
     name: str
     values: np.ndarray           # length-n_trials trial-by-trial values
     modulates: Optional[Sequence[str]] = None
+
+
+@dataclass
+class _CrossValidationResult:
+    """Internal result shared by all trial-held-out evaluation methods."""
+
+    r2_per_fold: np.ndarray
+    delta_r2_per_fold: Optional[np.ndarray]
+    n_iter_per_fold: np.ndarray
 
 
 # ---------------------------------------------------------------------------
@@ -929,9 +938,106 @@ class BilinearGLM:
             gv[self._gain_offset_idx[p.name]] = 1.0
         return gv
 
+    def _gain_keep_mask(self, *,
+                        remove_gains: Sequence[str] = (),
+                        remove_predictors: Sequence[str] = ()) -> np.ndarray:
+        """Gain-vector columns retained by a reduced model.
+
+        Removing a gain drops only its trial-variable slopes; each predictor's
+        baseline gain offset remains. Removing a predictor drops its offset and
+        every slope attached to it because its entire design block is absent.
+        """
+        known_gains = {g.name for g in self.gains}
+        unknown_gains = sorted(set(remove_gains) - known_gains)
+        if unknown_gains:
+            raise ValueError(f"unknown gains: {unknown_gains}")
+
+        known_predictors = set(self._pred_idx)
+        unknown_predictors = sorted(
+            set(remove_predictors) - known_predictors)
+        if unknown_predictors:
+            raise ValueError(f"unknown predictors: {unknown_predictors}")
+
+        keep = np.ones(self._gain_size, dtype=bool)
+        for gain_name in remove_gains:
+            for p in self._modulated:
+                key = (gain_name, p.name)
+                if key in self._gain_var_idx:
+                    keep[self._gain_var_idx[key]] = False
+        for pred_name in remove_predictors:
+            if pred_name not in self._gain_offset_idx:
+                continue
+            keep[self._gain_offset_idx[pred_name]] = False
+            for gain_name in self._gains_for[pred_name]:
+                keep[self._gain_var_idx[(gain_name, pred_name)]] = False
+        return keep
+
+    def _fit_gain_coefficients(self, Z: Optional[np.ndarray],
+                               target: np.ndarray, *,
+                               keep_mask: Optional[np.ndarray] = None,
+                               alpha: Optional[float] = None
+                               ) -> tuple[np.ndarray, Optional[float]]:
+        """Fit retained gain columns and expand back to the full gain vector."""
+        gain_vec = np.zeros(self._gain_size)
+        if Z is None or self._gain_size == 0:
+            return gain_vec, None
+
+        if keep_mask is None:
+            keep = np.ones(self._gain_size, dtype=bool)
+        else:
+            keep = np.asarray(keep_mask, dtype=bool).ravel()
+            if keep.size != self._gain_size:
+                raise ValueError(
+                    f"gain keep mask has length {keep.size}, expected "
+                    f"{self._gain_size}")
+        if not keep.any():
+            return gain_vec, None
+
+        Z_fit = Z[:, keep]
+        if alpha is None:
+            solver = RidgeCV(alphas=self.alphas, cv=self.cv_folds,
+                             fit_intercept=False)
+            solver.fit(Z_fit, target)
+            selected_alpha = float(solver.alpha_)
+        else:
+            solver = Ridge(alpha=alpha, fit_intercept=False)
+            solver.fit(Z_fit, target)
+            selected_alpha = float(alpha)
+        gain_vec[keep] = solver.coef_
+        return gain_vec, selected_alpha
+
+    def _refit_gains(self, y: np.ndarray, blocks: dict, gain_t: dict,
+                     beta: np.ndarray, b0: float, *,
+                     keep_mask: Optional[np.ndarray] = None,
+                     alpha: Optional[float] = None
+                     ) -> tuple[np.ndarray, Optional[float]]:
+        """Refit gains with kernels and intercept fixed.
+
+        This is the final step of a full fit and the reduced-model operation
+        used when testing trial-by-trial gains. If ``alpha`` is None, ridge
+        regularization is selected afresh for this particular gain model.
+        """
+        drives = self._kernel_drives(blocks, beta)
+        offset_t = np.full(y.size, b0)
+        for p in self.predictors:
+            if not p.gain_modulated:
+                offset_t = offset_t + drives[p.name]
+        target = y - offset_t
+        Z = self._build_gain_design(drives, gain_t)
+        return self._fit_gain_coefficients(
+            Z, target, keep_mask=keep_mask, alpha=alpha)
+
+    @staticmethod
+    def _r2_score(y: np.ndarray, yhat: np.ndarray) -> float:
+        ss_tot = float(np.sum((y - y.mean()) ** 2))
+        if ss_tot <= 0.0:
+            return float("nan")
+        return 1.0 - float(np.sum((y - yhat) ** 2)) / ss_tot
+
     # ----- fit / predict ----------------------------------------------------
 
     def _fit_als(self, y: np.ndarray, blocks: dict, gain_t: dict, *,
+                 gain_keep_mask: Optional[np.ndarray] = None,
                  max_iter: int = 100, tol: float = 1e-3,
                  patience: int = 3, verbose: bool = False):
         """Core ALS loop operating on pre-built blocks and gain_t arrays.
@@ -945,6 +1051,16 @@ class BilinearGLM:
         b0 = 0.0
         history = []
 
+        if gain_keep_mask is None:
+            gain_keep = np.ones(self._gain_size, dtype=bool)
+        else:
+            gain_keep = np.asarray(gain_keep_mask, dtype=bool).ravel()
+            if gain_keep.size != self._gain_size:
+                raise ValueError(
+                    f"gain keep mask has length {gain_keep.size}, expected "
+                    f"{self._gain_size}")
+            gain_vec[~gain_keep] = 0.0
+
         kernel_alpha = self.kernel_alpha
         gain_alpha = self.gain_alpha
 
@@ -954,10 +1070,10 @@ class BilinearGLM:
         # than a cold restart since the kernels change only modestly between
         # ALS sweeps. Ridge has a closed-form solve, so reuse is cosmetic.
         kernel_solver = None
-        gain_solver = None
 
         var_indices = [self._gain_var_idx[(v, p)]
-                       for (v, p) in self._gain_var_idx]
+                       for (v, p) in self._gain_var_idx
+                       if gain_keep[self._gain_var_idx[(v, p)]]]
         prev_gain_vars = (gain_vec[var_indices].copy()
                           if var_indices else np.zeros(0))
         stable_iters = 0
@@ -1024,18 +1140,10 @@ class BilinearGLM:
             Z = self._build_gain_design(drives, gain_t)
 
             if Z is not None and Z.shape[1] > 0:
+                gain_vec, fitted_gain_alpha = self._fit_gain_coefficients(
+                    Z, target, keep_mask=gain_keep, alpha=gain_alpha)
                 if gain_alpha is None:
-                    cv = RidgeCV(alphas=self.alphas, cv=self.cv_folds,
-                                 fit_intercept=False)
-                    cv.fit(Z, target)
-                    gain_alpha = float(cv.alpha_)
-                    gain_vec = cv.coef_.copy()
-                else:
-                    if gain_solver is None:
-                        gain_solver = Ridge(alpha=gain_alpha,
-                                             fit_intercept=False)
-                    gain_solver.fit(Z, target)
-                    gain_vec = gain_solver.coef_.copy()
+                    gain_alpha = fitted_gain_alpha
 
             # ---- bookkeeping -----------------------------------------------
             yhat = self._predict_from_state(blocks, gain_t, beta, gain_vec, b0)
@@ -1044,9 +1152,11 @@ class BilinearGLM:
                             "kernel_alpha": kernel_alpha,
                             "gain_alpha": gain_alpha})
             if verbose:
+                gain_alpha_text = ("none" if gain_alpha is None
+                                   else f"{gain_alpha:.3g}")
                 print(f"iter {it:3d}  mse={mse:.6g}  "
                       f"kernel_alpha={kernel_alpha:.3g}  "
-                      f"gain_alpha={gain_alpha:.3g}")
+                      f"gain_alpha={gain_alpha_text}")
 
             if var_indices:
                 cur = gain_vec[var_indices]
@@ -1058,6 +1168,18 @@ class BilinearGLM:
                         break
                 else:
                     stable_iters = 0
+
+        # The alpha selected during ALS belongs to an earlier kernel iterate.
+        # Refit the full gain model against the final kernels, selecting its
+        # regularization afresh unless the caller fixed ``gain_alpha``.
+        gain_vec, final_gain_alpha = self._refit_gains(
+            y, blocks, gain_t, beta, b0,
+            keep_mask=gain_keep, alpha=self.gain_alpha)
+        if history:
+            final_yhat = self._predict_from_state(
+                blocks, gain_t, beta, gain_vec, b0)
+            history[-1]["mse"] = float(np.mean((y - final_yhat) ** 2))
+            history[-1]["gain_alpha"] = final_gain_alpha
 
         return beta, gain_vec, b0, history
 
@@ -1191,6 +1313,146 @@ class BilinearGLM:
         )
         return self
 
+    def _cross_validate_prepared(
+            self, y: np.ndarray, trial_idx: np.ndarray,
+            blocks: dict, gain_t: dict, eval_mask: np.ndarray, *,
+            remove_gains: Sequence[str] = (),
+            remove_predictors: Sequence[str] = (),
+            n_folds: int = 5, fold_seed: Optional[int] = None,
+            gap_history=False,
+            max_iter: int = 100, tol: float = 1e-3,
+            patience: int = 3, verbose: bool = False,
+            ) -> _CrossValidationResult:
+        """Shared trial-held-out evaluator over an already-built design.
+
+        Gain-only reduced models keep each fold's final kernels and intercept
+        but refit the retained gain coefficients with their own ridge alpha.
+        If predictors are removed, the reduced model receives a full ALS refit
+        with those design blocks zeroed, which is equivalent to omitting them
+        while preserving this model's coefficient layout.
+        """
+        T = y.size
+        eval_mask = np.asarray(eval_mask, dtype=bool).ravel()
+        if eval_mask.size != T:
+            raise ValueError(
+                f"evaluation mask must have length T={T}, "
+                f"got {eval_mask.size}")
+
+        if gap_history:
+            if self._history_predictor_name is None:
+                raise ValueError(
+                    "gap_history requires spike_history to be configured "
+                    "on the model")
+            gap_bins = (int(self._lags[self._history_predictor_name].max())
+                        if gap_history is True else int(gap_history))
+        else:
+            gap_bins = 0
+
+        compute_delta = bool(remove_gains) or bool(remove_predictors)
+        reduced_gain_keep = self._gain_keep_mask(
+            remove_gains=remove_gains,
+            remove_predictors=remove_predictors)
+
+        trials = np.unique(trial_idx)
+        if n_folds < 2:
+            raise ValueError("n_folds must be >= 2")
+        if n_folds > trials.size:
+            raise ValueError(
+                f"n_folds={n_folds} exceeds the number of trials "
+                f"({trials.size})")
+        if fold_seed is not None:
+            trials = np.random.default_rng(fold_seed).permutation(trials)
+        folds = np.array_split(trials, n_folds)
+
+        cv_r2 = []
+        cv_delta = [] if compute_delta else None
+        n_iter_per_fold = []
+
+        removed_predictors = set(remove_predictors)
+        for fold_i, test_trials in enumerate(folds):
+            train_trials = np.setdiff1d(trials, test_trials)
+            train_in_fold = np.isin(trial_idx, train_trials)
+            test_in_fold = np.isin(trial_idx, test_trials)
+            if gap_bins > 0:
+                train_in_fold = self._safe_under_history(
+                    train_in_fold, gap_bins)
+                test_in_fold = self._safe_under_history(
+                    test_in_fold, gap_bins)
+            train_mask = train_in_fold & eval_mask
+            test_mask = test_in_fold & eval_mask
+
+            y_tr = y[train_mask]
+            blocks_tr = {k: v[train_mask] for k, v in blocks.items()}
+            gain_t_tr = {k: v[train_mask] for k, v in gain_t.items()}
+
+            if verbose:
+                print(f"\n=== CV fold {fold_i + 1}/{n_folds} "
+                      f"({test_mask.sum()} test bins, "
+                      f"{train_mask.sum()} train bins"
+                      + (f", gap={gap_bins}" if gap_bins else "")
+                      + ") ===")
+
+            beta, gain_vec, b0, fold_history = self._fit_als(
+                y_tr, blocks_tr, gain_t_tr,
+                max_iter=max_iter, tol=tol, patience=patience,
+                verbose=verbose)
+            n_iter_per_fold.append(len(fold_history))
+
+            y_te = y[test_mask]
+            blocks_te = {k: v[test_mask] for k, v in blocks.items()}
+            gain_t_te = {k: v[test_mask] for k, v in gain_t.items()}
+            full_yhat = self._predict_from_state(
+                blocks_te, gain_t_te, beta, gain_vec, b0)
+            r2_full = self._r2_score(y_te, full_yhat)
+            cv_r2.append(r2_full)
+
+            if compute_delta:
+                if removed_predictors:
+                    reduced_blocks_tr = {
+                        name: (np.zeros_like(block)
+                               if name in removed_predictors else block)
+                        for name, block in blocks_tr.items()
+                    }
+                    beta_red, gain_red, b0_red, _ = self._fit_als(
+                        y_tr, reduced_blocks_tr, gain_t_tr,
+                        gain_keep_mask=reduced_gain_keep,
+                        max_iter=max_iter, tol=tol, patience=patience,
+                        verbose=verbose)
+                    reduced_blocks_te = {
+                        name: (np.zeros_like(block)
+                               if name in removed_predictors else block)
+                        for name, block in blocks_te.items()
+                    }
+                else:
+                    # Paper-style gain comparison: preserve response shapes
+                    # from the full fold fit, but fit the reduced gain model.
+                    gain_red, _ = self._refit_gains(
+                        y_tr, blocks_tr, gain_t_tr, beta, b0,
+                        keep_mask=reduced_gain_keep,
+                        alpha=self.gain_alpha)
+                    beta_red = beta
+                    b0_red = b0
+                    reduced_blocks_te = blocks_te
+
+                reduced_yhat = self._predict_from_state(
+                    reduced_blocks_te, gain_t_te,
+                    beta_red, gain_red, b0_red)
+                r2_reduced = self._r2_score(y_te, reduced_yhat)
+                cv_delta.append(r2_full - r2_reduced)
+
+            if verbose:
+                message = f"  fold {fold_i + 1} R²={r2_full:.4f}"
+                if compute_delta:
+                    message += f"  ΔR²={cv_delta[-1]:+.4f}"
+                print(message)
+
+        return _CrossValidationResult(
+            r2_per_fold=np.asarray(cv_r2, dtype=float),
+            delta_r2_per_fold=(np.asarray(cv_delta, dtype=float)
+                               if cv_delta is not None else None),
+            n_iter_per_fold=np.asarray(n_iter_per_fold, dtype=int),
+        )
+
     def cross_val_score(self, y: np.ndarray, trial_idx: np.ndarray, *,
                         fit_mask: Optional[np.ndarray] = None,
                         gap_history=False,
@@ -1234,8 +1496,8 @@ class BilinearGLM:
         Does NOT update `self.beta_` / `self.gain_` / `self.intercept_`.
         Call `fit()` separately to obtain a model trained on all data.
         """
-        y = np.asarray(y, dtype=float).ravel()
-        T = y.size
+        y_arr = np.asarray(y, dtype=float).ravel()
+        T = y_arr.size
         trial_idx = np.asarray(trial_idx, dtype=int).ravel()
         if trial_idx.size != T:
             raise ValueError("trial_idx must have the same length as y")
@@ -1250,71 +1512,15 @@ class BilinearGLM:
         else:
             eval_mask = np.ones(T, dtype=bool)
 
-        if gap_history:
-            if self._history_predictor_name is None:
-                raise ValueError(
-                    "gap_history requires spike_history to be configured "
-                    "on the model")
-            if gap_history is True:
-                gap_bins = int(self._lags[self._history_predictor_name].max())
-            else:
-                gap_bins = int(gap_history)
-        else:
-            gap_bins = 0
-
-        # build design blocks once using all time bins (convolution is global)
-        series = self._input_series(T, overrides=self._with_history(None, y))
-        blocks = self._design_blocks(series)
-        gain_t = self._gain_per_t(T, trial_idx)
-
-        trials = np.unique(trial_idx)
-        if fold_seed is not None:
-            trials = np.random.default_rng(fold_seed).permutation(trials)
-        folds = np.array_split(trials, n_folds)
-
-        cv_scores = []
-        for fold_i, test_trials in enumerate(folds):
-            train_trials = np.setdiff1d(trials, test_trials)
-            train_in_fold = np.isin(trial_idx, train_trials)
-            test_in_fold = np.isin(trial_idx, test_trials)
-            if gap_bins > 0:
-                train_in_fold = self._safe_under_history(train_in_fold,
-                                                         gap_bins)
-                test_in_fold = self._safe_under_history(test_in_fold,
-                                                        gap_bins)
-            train_mask = train_in_fold & eval_mask
-            test_mask = test_in_fold & eval_mask
-
-            y_tr = y[train_mask]
-            blocks_tr = {k: v[train_mask] for k, v in blocks.items()}
-            gain_t_tr = {k: v[train_mask] for k, v in gain_t.items()}
-
-            if verbose:
-                print(f"\n=== CV fold {fold_i + 1}/{n_folds} "
-                      f"({test_mask.sum()} test bins, "
-                      f"{train_mask.sum()} train bins"
-                      + (f", gap={gap_bins}" if gap_bins else "")
-                      + ") ===")
-
-            beta, gain_vec, b0, _ = self._fit_als(
-                y_tr, blocks_tr, gain_t_tr,
-                max_iter=max_iter, tol=tol, patience=patience, verbose=verbose,
-            )
-
-            y_te = y[test_mask]
-            blocks_te = {k: v[test_mask] for k, v in blocks.items()}
-            gain_t_te = {k: v[test_mask] for k, v in gain_t.items()}
-            yhat_te = self._predict_from_state(
-                blocks_te, gain_t_te, beta, gain_vec, b0)
-
-            ss_res = float(np.sum((y_te - yhat_te) ** 2))
-            ss_tot = float(np.sum((y_te - y_te.mean()) ** 2))
-            r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
-            cv_scores.append(r2)
-            if verbose:
-                print(f"  fold {fold_i + 1} R²={r2:.4f}")
-
-        self.cv_scores_ = np.array(cv_scores)
+        blocks, gain_t = self._resolve_design(
+            y_arr, T, trial_idx, design=None)
+        result = self._cross_validate_prepared(
+            y_arr, trial_idx, blocks, gain_t, eval_mask,
+            n_folds=n_folds, fold_seed=fold_seed,
+            gap_history=gap_history,
+            max_iter=max_iter, tol=tol, patience=patience,
+            verbose=verbose)
+        self.cv_scores_ = result.r2_per_fold
         return float(np.nanmean(self.cv_scores_))
 
     def fit_summary(self, y: np.ndarray, trial_idx: np.ndarray, *,
@@ -1329,14 +1535,13 @@ class BilinearGLM:
         """Fit + in-sample R² + CV R² + ΔR² in one shared pass.
 
         Equivalent to calling ``fit``, ``score``, ``cross_val_score``, and
-        ``delta_r2`` separately, but does roughly half the work: the design
-        matrix is built once, and the same five fold-fits power both the CV
-        R² and the ΔR² (the full and reduced predictions are scored on the
-        same held-out test bins).
+        ``delta_r2`` separately, but shares one design build and one set of
+        full-model fold fits. Gain-only reduced models add inexpensive ridge
+        refits against those folds' final kernels. Whole-predictor reductions
+        add one reduced ALS fit per fold.
 
-        For one cell with default 5-fold CV:
-          - separate calls: 4 design builds + 11 ALS fits
-          - fit_summary:    1 design build  + 6 ALS fits
+        In every case, full and reduced predictions are scored on identical
+        held-out bins.
 
         After this method returns, the model is fitted on the full training
         data (``self.beta_``, ``self.gain_``, ``self.intercept_`` are set),
@@ -1345,7 +1550,9 @@ class BilinearGLM:
         Parameters
         ----------
         y, trial_idx : as in ``fit``.
-        remove_gains, remove_predictors : as in ``delta_r2``. If both are
+        remove_gains, remove_predictors : as in ``delta_r2``. Gain-only
+            reductions refit gains with the full model's final kernels;
+            predictor reductions refit the reduced ALS model. If both are
             empty, the ΔR² fields of the returned dict are None.
         fit_mask, n_folds, fold_seed, gap_history : as in ``cross_val_score``.
         design : optional precomputed design dict (see
@@ -1386,16 +1593,6 @@ class BilinearGLM:
             mask = None
         eval_mask = mask if mask is not None else np.ones(T, dtype=bool)
 
-        if gap_history:
-            if self._history_predictor_name is None:
-                raise ValueError(
-                    "gap_history requires spike_history to be configured "
-                    "on the model")
-            gap_bins = (int(self._lags[self._history_predictor_name].max())
-                        if gap_history is True else int(gap_history))
-        else:
-            gap_bins = 0
-
         # Build design ONCE — shared across full fit, in-sample R², all folds.
         # If `design` was supplied (precompute_design output), use it and only
         # rebuild the history block from this cell's y.
@@ -1423,83 +1620,19 @@ class BilinearGLM:
         train_r2 = (1.0 - float(np.sum((y_in - yhat_in) ** 2)) / ss_tot_in
                     if ss_tot_in > 0 else float("nan"))
 
-        # --- CV pass: full R² and (optional) ΔR² in the same folds ----------
-        compute_delta = bool(remove_gains) or bool(remove_predictors)
-        trials = np.unique(trial_idx)
-        if fold_seed is not None:
-            trials = np.random.default_rng(fold_seed).permutation(trials)
-        folds = np.array_split(trials, n_folds)
-        cv_r2 = []
-        cv_delta = [] if compute_delta else None
-        n_iter_per_fold = []
-
-        for fold_i, test_trials in enumerate(folds):
-            train_trials = np.setdiff1d(trials, test_trials)
-            train_in_fold = np.isin(trial_idx, train_trials)
-            test_in_fold = np.isin(trial_idx, test_trials)
-            if gap_bins > 0:
-                train_in_fold = self._safe_under_history(
-                    train_in_fold, gap_bins)
-                test_in_fold = self._safe_under_history(
-                    test_in_fold, gap_bins)
-            train_mask = train_in_fold & eval_mask
-            test_mask = test_in_fold & eval_mask
-
-            y_tr = y_arr[train_mask]
-            blocks_tr = {k: v[train_mask] for k, v in blocks.items()}
-            gain_t_tr = {k: v[train_mask] for k, v in gain_t.items()}
-
-            if verbose:
-                print(f"\n=== fold {fold_i + 1}/{n_folds} "
-                      f"({test_mask.sum()} test bins, "
-                      f"{train_mask.sum()} train bins"
-                      + (f", gap={gap_bins}" if gap_bins else "")
-                      + ") ===")
-
-            beta, gain_vec, b0, fold_history = self._fit_als(
-                y_tr, blocks_tr, gain_t_tr,
-                max_iter=max_iter, tol=tol, patience=patience,
-                verbose=verbose)
-            n_iter_per_fold.append(len(fold_history))
-
-            y_te = y_arr[test_mask]
-            blocks_te = {k: v[test_mask] for k, v in blocks.items()}
-            gain_t_te = {k: v[test_mask] for k, v in gain_t.items()}
-            full_yhat = self._predict_from_state(
-                blocks_te, gain_t_te, beta, gain_vec, b0)
-            ss_tot = float(np.sum((y_te - y_te.mean()) ** 2))
-            if ss_tot == 0.0:
-                cv_r2.append(float("nan"))
-                if cv_delta is not None:
-                    cv_delta.append(float("nan"))
-                continue
-            r2_full = 1.0 - float(np.sum((y_te - full_yhat) ** 2)) / ss_tot
-            cv_r2.append(r2_full)
-
-            if compute_delta:
-                beta_red = beta.copy()
-                gain_red = gain_vec.copy()
-                for vname in remove_gains:
-                    for p in self._modulated:
-                        key = (vname, p.name)
-                        if key in self._gain_var_idx:
-                            gain_red[self._gain_var_idx[key]] = 0.0
-                for pname in remove_predictors:
-                    k = self._pred_idx[pname]
-                    beta_red[
-                        self._beta_off[k]:self._beta_off[k + 1]] = 0.0
-                red_yhat = self._predict_from_state(
-                    blocks_te, gain_t_te, beta_red, gain_red, b0)
-                r2_red = 1.0 - float(np.sum(
-                    (y_te - red_yhat) ** 2)) / ss_tot
-                cv_delta.append(r2_full - r2_red)
-
-        cv_r2_arr = np.array(cv_r2)
-        cv_delta_arr = (np.array(cv_delta)
-                        if cv_delta is not None else None)
+        # --- CV pass: full R² and optional refit reduced-model ΔR² ----------
+        cv_result = self._cross_validate_prepared(
+            y_arr, trial_idx, blocks, gain_t, eval_mask,
+            remove_gains=remove_gains,
+            remove_predictors=remove_predictors,
+            n_folds=n_folds, fold_seed=fold_seed,
+            gap_history=gap_history,
+            max_iter=max_iter, tol=tol, patience=patience,
+            verbose=verbose)
+        cv_r2_arr = cv_result.r2_per_fold
+        cv_delta_arr = cv_result.delta_r2_per_fold
         self.cv_scores_ = cv_r2_arr
-        if cv_delta_arr is not None:
-            self.cv_delta_r2_ = cv_delta_arr
+        self.cv_delta_r2_ = cv_delta_arr
 
         return {
             "train_r2": train_r2,
@@ -1513,7 +1646,7 @@ class BilinearGLM:
             "gain_table": self.gain_table(),
             "intercept": float(self.intercept_),
             "n_iter": len(self.history_),
-            "n_iter_per_fold": np.array(n_iter_per_fold),
+            "n_iter_per_fold": cv_result.n_iter_per_fold,
             "converged": len(self.history_) < max_iter,
         }
 
@@ -2046,23 +2179,28 @@ class BilinearGLM:
                  remove_gains: Sequence[str] = (),
                  remove_predictors: Sequence[str] = (),
                  fit_mask: Optional[np.ndarray] = None,
-                 n_folds: int = 5, gap_history=False,
+                 design: Optional[dict] = None,
+                 n_folds: int = 5, fold_seed: Optional[int] = None,
+                 gap_history=False,
                  max_iter: int = 100, tol: float = 1e-3,
                  patience: int = 3, verbose: bool = False) -> float:
         """Cross-validated ΔR² = R²(full) - R²(reduced) on held-out test trials.
 
-        Trials are partitioned into `n_folds` contiguous groups (same scheme
-        as `cross_val_score`). For each fold the full model is refit on
-        training trials; the reduced model is obtained by zeroing the
-        specified value-gain coefficients and/or whole predictor blocks from
-        the fold's fitted parameters (kernels and gain offsets are NOT refit
-        under the null — matches the paper's "kernels held at the final
-        iteration; only the targeted gains are removed" comparison). Both
-        predictions are then evaluated on the held-out test bins.
+        For gain-only comparisons, each fold's full bilinear model supplies
+        the final temporal kernels and intercept. Full gains are refit against
+        those final kernels, and the reduced gains are independently refit
+        after removing the requested trial-variable columns. This matches the
+        paper's fixed-kernel comparison while allowing retained gain terms to
+        adjust to the reduced model.
+
+        Removing whole predictors instead triggers a full reduced ALS fit in
+        each training fold, with those predictor blocks omitted. If gains and
+        predictors are both removed, both restrictions apply to that reduced
+        fit.
 
         If `fit_mask` is given (or one was stored at fit time), both training
-        and test rows are restricted to its True bins. `gap_history` works
-        as in `cross_val_score`.
+        and test rows are restricted to its True bins. `design`, `fold_seed`,
+        and `gap_history` work as in `fit_summary` / `cross_val_score`.
 
         Returns the mean ΔR² across folds; per-fold values are stored in
         `self.cv_delta_r2_`.
@@ -2085,84 +2223,21 @@ class BilinearGLM:
         else:
             eval_mask = np.ones(T, dtype=bool)
 
-        if gap_history:
-            if self._history_predictor_name is None:
-                raise ValueError(
-                    "gap_history requires spike_history to be configured "
-                    "on the model")
-            if gap_history is True:
-                gap_bins = int(self._lags[self._history_predictor_name].max())
-            else:
-                gap_bins = int(gap_history)
-        else:
-            gap_bins = 0
-
-        series = self._input_series(T,
-                                    overrides=self._with_history(None, y_arr))
-        blocks = self._design_blocks(series)
-        gain_t = self._gain_per_t(T, trial_idx)
-
-        trials = np.unique(trial_idx)
-        folds = np.array_split(trials, n_folds)
-
-        deltas = []
-        for fold_i, test_trials in enumerate(folds):
-            train_trials = np.setdiff1d(trials, test_trials)
-            train_in_fold = np.isin(trial_idx, train_trials)
-            test_in_fold = np.isin(trial_idx, test_trials)
-            if gap_bins > 0:
-                train_in_fold = self._safe_under_history(train_in_fold,
-                                                         gap_bins)
-                test_in_fold = self._safe_under_history(test_in_fold,
-                                                        gap_bins)
-            train_mask = train_in_fold & eval_mask
-            test_mask = test_in_fold & eval_mask
-
-            y_tr = y_arr[train_mask]
-            blocks_tr = {k: v[train_mask] for k, v in blocks.items()}
-            gain_t_tr = {k: v[train_mask] for k, v in gain_t.items()}
-
-            if verbose:
-                print(f"\n=== ΔR² CV fold {fold_i + 1}/{n_folds} "
-                      f"({test_mask.sum()} test bins, "
-                      f"{train_mask.sum()} train bins"
-                      + (f", gap={gap_bins}" if gap_bins else "")
-                      + ") ===")
-
-            beta, gain_vec, b0, _ = self._fit_als(
-                y_tr, blocks_tr, gain_t_tr,
-                max_iter=max_iter, tol=tol, patience=patience, verbose=verbose,
-            )
-
-            beta_red = beta.copy()
-            gain_red = gain_vec.copy()
-            for vname in remove_gains:
-                for p in self._modulated:
-                    key = (vname, p.name)
-                    if key in self._gain_var_idx:
-                        gain_red[self._gain_var_idx[key]] = 0.0
-            for pname in remove_predictors:
-                k = self._pred_idx[pname]
-                beta_red[self._beta_off[k]:self._beta_off[k + 1]] = 0.0
-
-            y_te = y_arr[test_mask]
-            blocks_te = {k: v[test_mask] for k, v in blocks.items()}
-            gain_t_te = {k: v[test_mask] for k, v in gain_t.items()}
-            full_yhat = self._predict_from_state(
-                blocks_te, gain_t_te, beta, gain_vec, b0)
-            red_yhat = self._predict_from_state(
-                blocks_te, gain_t_te, beta_red, gain_red, b0)
-            ss_tot = float(np.sum((y_te - y_te.mean()) ** 2))
-            if ss_tot == 0.0:
-                deltas.append(float("nan"))
-                continue
-            r2_full = 1.0 - float(np.sum((y_te - full_yhat) ** 2)) / ss_tot
-            r2_red = 1.0 - float(np.sum((y_te - red_yhat) ** 2)) / ss_tot
-            deltas.append(r2_full - r2_red)
-            if verbose:
-                print(f"  fold {fold_i + 1} ΔR²={deltas[-1]:+.4f}")
-
-        self.cv_delta_r2_ = np.array(deltas)
+        blocks, gain_t = self._resolve_design(
+            y_arr, T, trial_idx, design)
+        result = self._cross_validate_prepared(
+            y_arr, trial_idx, blocks, gain_t, eval_mask,
+            remove_gains=remove_gains,
+            remove_predictors=remove_predictors,
+            n_folds=n_folds, fold_seed=fold_seed,
+            gap_history=gap_history,
+            max_iter=max_iter, tol=tol, patience=patience,
+            verbose=verbose)
+        self.cv_scores_ = result.r2_per_fold
+        self.cv_delta_r2_ = (
+            result.delta_r2_per_fold
+            if result.delta_r2_per_fold is not None
+            else np.zeros_like(result.r2_per_fold))
         return float(np.nanmean(self.cv_delta_r2_))
 
     # ----- pseudosession permutation test -----------------------------------
@@ -2177,7 +2252,9 @@ class BilinearGLM:
         Holds kernels and intercept fixed at their fitted values; for each of
         `n_perm` shuffles, draws a circularly shifted version of the gain's
         trial values, refits *only* the gain coefficients (ridge), and records
-        ΔR². P-value is the fraction of nulls with ΔR² >= observed.
+        ΔR². Full and reduced gain models select regularization independently
+        unless ``gain_alpha`` was fixed at construction. P-value is the
+        fraction of nulls with ΔR² >= observed.
 
         If `fit_mask` is given (or one was stored at fit time), both the gain
         refits and the ΔR² are restricted to masked bins — same window the
@@ -2218,14 +2295,8 @@ class BilinearGLM:
         target_fit  = target[mask]
         Z_full_fit  = Z_full[mask]
 
-        gain_alpha = (self.history_[-1]["gain_alpha"]
-                      if self.history_ else 1.0)
-        rm = Ridge(alpha=gain_alpha, fit_intercept=False)
-        rm.fit(Z_full_fit, target_fit)
-        full_pred_fit = offset_fit + Z_full_fit @ rm.coef_
         observed = self._delta_r2_remove(
-            y_fit, full_pred_fit, Z_full_fit, rm.coef_,
-            target_fit, gain_alpha, gain_name)
+            y_fit, offset_fit, Z_full_fit, target_fit, gain_name)
 
         # null distribution: circularly shift this gain's trial values
         gv = next(g for g in self.gains if g.name == gain_name)
@@ -2238,31 +2309,19 @@ class BilinearGLM:
             gain_t_null[gain_name] = shuffled[trial_idx]
             Z_null = self._build_gain_design(drives, gain_t_null)
             Z_null_fit = Z_null[mask]
-            m2 = Ridge(alpha=gain_alpha, fit_intercept=False)
-            m2.fit(Z_null_fit, target_fit)
             nulls[i] = self._delta_r2_remove(
-                y_fit, offset_fit + Z_null_fit @ m2.coef_,
-                Z_null_fit, m2.coef_, target_fit, gain_alpha, gain_name)
+                y_fit, offset_fit, Z_null_fit, target_fit, gain_name)
         p = float(np.mean(nulls >= observed))
         return {"observed": float(observed), "null": nulls, "p": p}
 
-    def _delta_r2_remove(self, y, full_yhat, Z, coef, target, alpha,
-                          gain_name):
-        ss_tot = float(np.sum((y - y.mean()) ** 2))
-        if ss_tot == 0:
-            return float("nan")
-        r2_full = 1.0 - float(np.sum((y - full_yhat) ** 2)) / ss_tot
-        # reduced: zero out every column corresponding to gain_name
-        keep = np.ones(Z.shape[1], dtype=bool)
-        for p in self._modulated:
-            key = (gain_name, p.name)
-            if key in self._gain_var_idx:
-                keep[self._gain_var_idx[key]] = False
-        if keep.all():
-            return 0.0
-        Z_red = Z[:, keep]
-        m = Ridge(alpha=alpha, fit_intercept=False)
-        m.fit(Z_red, target)
-        red_yhat = (y - target) + Z_red @ m.coef_
-        r2_red = 1.0 - float(np.sum((y - red_yhat) ** 2)) / ss_tot
-        return r2_full - r2_red
+    def _delta_r2_remove(self, y, offset, Z, target, gain_name):
+        """Gain-only ΔR² with independently refit full and reduced ridge."""
+        full_coef, _ = self._fit_gain_coefficients(
+            Z, target, alpha=self.gain_alpha)
+        keep = self._gain_keep_mask(remove_gains=[gain_name])
+        reduced_coef, _ = self._fit_gain_coefficients(
+            Z, target, keep_mask=keep, alpha=self.gain_alpha)
+        full_yhat = offset + Z @ full_coef
+        reduced_yhat = offset + Z @ reduced_coef
+        return (self._r2_score(y, full_yhat)
+                - self._r2_score(y, reduced_yhat))

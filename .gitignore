@@ -12,3 +12,4 @@ wheels/
 *.pdf
 scratch.ipynb
 *.png
+*.json

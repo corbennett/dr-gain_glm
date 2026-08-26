@@ -240,9 +240,9 @@ These run every fit / predict call to build the per-bin design.
 
 | Method | What it does |
 |---|---|
-| [_fit_als](bilinear_glm.py#L400) | Core ALS loop. Operates on pre-built design blocks and gain arrays so it can be called with any subset of time bins (used by `cross_val_score` for the train fold). Returns `(beta, gain_vec, b0, history)`. See [the section below](#the-als-fit-loop-in-detail). |
+| [_fit_als](bilinear_glm.py#L400) | Core ALS loop. Operates on pre-built design blocks and gain arrays so it can be called with any subset of time bins (used by `cross_val_score` for the train fold). After convergence it refits gains against the final kernels with freshly selected regularization. Returns `(beta, gain_vec, b0, history)`. See [the section below](#the-als-fit-loop-in-detail). |
 | [fit](bilinear_glm.py#L506) | Public fit entry. Builds the full-data design once and calls `_fit_als`. Populates `self.beta_`, `self.gain_`, `self.intercept_`, `self.history_`. |
-| [cross_val_score](bilinear_glm.py#L530) | Trial-held-out k-fold CV. Partitions trials into `n_folds` contiguous groups; for each fold, refits ALS on training rows only (but builds the design over the full session so convolutions that span trial boundaries are handled correctly) and scores on test rows. Returns mean R²; per-fold scores in `self.cv_scores_`. Does **not** update fitted attributes. |
+| [cross_val_score](bilinear_glm.py#L530) | Trial-held-out k-fold CV. Partitions trials into contiguous groups by default, or reproducibly shuffled groups with `fold_seed`; for each fold, refits ALS on training rows only and scores on test rows. Returns mean R²; per-fold scores in `self.cv_scores_`. Does **not** update fitted attributes. |
 | [_predict_from_state](bilinear_glm.py#L597) | Given pre-built blocks, gains, and a $(\beta, g, b_0)$ triple, returns the model's predicted $(T,)$ time course. Sums intercept + each non-modulated drive + each modulated drive weighted by $w_p(t)$. Used by both `predict` and the CV path. |
 | [predict](bilinear_glm.py#L612) | Public predict. Builds blocks / gains for the requested `(y, trial_idx)` and calls `_predict_from_state` with the fitted parameters. Accepts `event_overrides`, `continuous_overrides`, and `gain_overrides` to swap in alternative inputs without refitting — useful for spike-history simulation or pseudosession-style null distributions. |
 | [score](bilinear_glm.py#L638) | R² of the fitted model. |
@@ -265,8 +265,8 @@ These run every fit / predict call to build the per-bin design.
 
 | Method | What it does |
 |---|---|
-| [delta_r2](bilinear_glm.py#L678) | Cross-validated ΔR² between the full and reduced model on held-out test trials. For each fold the full model is refit on training trials; the reduced model zeros out specified gain slopes and/or whole predictor blocks from the fold's fitted parameters (kernels and offsets are **not** refit under the null — matches the paper's "kernels held at the final iteration; only the targeted gains are removed" comparison). Both predictions are scored on the test bins. |
-| [pseudosession_test](bilinear_glm.py#L718) | Circular-shift permutation test for a single gain variable. Holds kernels and intercept fixed at fitted values; refits only the gain coefficients for the real and shifted gain series; reports the observed ΔR² and the empirical p-value against the null distribution of shifts. |
+| [delta_r2](bilinear_glm.py#L678) | Cross-validated ΔR² between full and reduced models on held-out trials. Gain-only reductions preserve each fold's final kernels/intercept but refit retained gains with independently selected ridge regularization. Whole-predictor reductions receive a complete reduced ALS refit. Both predictions use identical test bins. |
+| [pseudosession_test](bilinear_glm.py#L718) | Circular-shift permutation test for a single gain variable. Holds kernels and intercept fixed at fitted values; independently refits full and reduced gain models for the real and shifted gain series; reports the observed ΔR² and empirical p-value. |
 | [_delta_r2_remove](bilinear_glm.py#L771) | Internal helper used by `pseudosession_test`. Refits gain coefficients on a column-removed copy of the gain design and returns the resulting ΔR². |
 
 ---
@@ -312,8 +312,11 @@ iterations (the offsets are intentionally allowed to drift with the gauge
 fix). If $\max |\Delta \beta^g_{v,p}| \le \text{tol}$ for `patience`
 consecutive iterations, stop.
 
-The loop builds an MSE / alpha history in `self.history_` so you can verify
-convergence post-hoc.
+After convergence, the gain regression is run once more against the final
+kernels. If `gain_alpha=None`, this final gain fit selects its alpha afresh;
+the selected value and final MSE replace the last entries in `self.history_`.
+This ensures the reported gains are tuned for the kernels that are actually
+returned.
 
 ### Alpha selection
 
@@ -324,9 +327,10 @@ convergence post-hoc.
 - A fixed float — skips CV entirely; useful for inner CV loops where the
   outer loop has already picked alphas.
 
-Once chosen on the first iteration, the same alphas are reused for
-subsequent ALS iterations — re-running CV every iteration would be
-wasteful and unstable.
+Once chosen on the first iteration, the same alphas are reused for subsequent
+ALS iterations. The final gain-only refit is the exception: it reselects
+`gain_alpha` against the final kernels. Reduced gain models also select their
+own alpha, unless a fixed `gain_alpha` was supplied explicitly.
 
 ---
 
@@ -334,24 +338,20 @@ wasteful and unstable.
 
 Two ways to test whether a gain variable matters:
 
-**`delta_r2`** is a cross-validated drop-one comparison: how much
-held-out $R^2$ does the full model lose if we zero out the slopes for
-gain $v$ (or the whole block of predictor $p$) from each fold's fitted
-parameters? Kernels and offsets are not refit under the null.
+**`delta_r2`** is a cross-validated drop-one comparison. For a removed gain
+$v$, each fold keeps the full model's final kernels and intercept but refits
+both the full and reduced gain regressions. This lets retained gain terms
+adjust after $v$ is removed and matches the paper's fixed-kernel comparison.
+Removing a whole predictor instead refits the complete reduced ALS model.
 
 $$
 \Delta R^2 = R^2_{\text{full}} - R^2_{\text{reduced}}
 $$
 
-**`pseudosession_test`** is the paper's circular-shift permutation test:
-randomly rotate the trial-value array, refit only the gain coefficients,
-record the $\Delta R^2$, repeat. Compare the observed $\Delta R^2$ to
-the null distribution. Slower (one ridge fit per permutation) but
-accounts for trial-temporal autocorrelation in the gain variable.
-
-For nested model comparisons that *refit kernels* under the null
-(stronger but much slower), refit a new `BilinearGLM` with the relevant
-gains/predictors removed and compare CV $R^2$ values.
+**`pseudosession_test`** circularly rotates the trial-value array, refits the
+full and reduced gains with the fitted kernels held fixed, records the
+$\Delta R^2$, and repeats. Comparing the observation to this null distribution
+helps account for trial-temporal autocorrelation in the gain variable.
 
 ---
 
