@@ -16,6 +16,7 @@ import argparse
 import json
 import pathlib
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import lazynwb
@@ -106,22 +107,49 @@ def load_y(nwb_path: str, unit_id: str, task_start_time: float,
         lazynwb.scan_nwb(nwb_path, "/units")
         .filter(pl.col("unit_id") == unit_id)
         .select("spike_times")
-        .collect()["spike_times"][0]
-        .to_numpy()
+        .collect()["spike_times"]
     )
+    if spike_times.is_empty():
+        raise ValueError(
+            f"unit_id {unit_id!r} not found in {nwb_path} /units "
+            f"(check the probe-letter case, e.g. 'C-301' vs 'c-301')")
+    spike_times = spike_times[0].to_numpy()
     return bin_spike_times(spike_times,
                            start=task_start_time + dt,
                            end=task_end_time + dt,
                            dt=dt)
 
 
-def build_session_design(nwb_path: str, dt: float = DT) -> dict:
-    """Build the predictors, model, trial index, and precomputed design for a
-    session. Everything here is shared across all of the session's units, so it
-    is built once and reused for every per-unit fit.
+@dataclass
+class SessionData:
+    """All NWB-derived data a design needs, loaded once per session.
 
-    Returns a dict with: model, trial_idx, design, task_start_time,
-    task_end_time, T (number of time bins).
+    This is the expensive part (S3 I/O) and is design-agnostic: load it once,
+    then build as many alternative designs from it as you like (see
+    `assemble_design` and compare_models.py). Timing fields define the y-grid.
+    """
+    nwb_path: str
+    dt: float
+    task_start_time: float
+    task_end_time: float
+    T: int                      # number of time bins on the y-grid
+    trials_df: "pl.DataFrame"
+    trial_start_times: ndarray
+    trial_end_times: ndarray
+    trial_context_labels: ndarray  # -1 aud-rewarded, +1 vis-rewarded, per trial
+    lick_times: ndarray            # absolute clock (not yet task-relative)
+    reward_times: ndarray
+    running_speed: ndarray         # (N, 2): [:, 0]=times, [:, 1]=speed
+    pupil: ndarray                 # (N, 2): [:, 0]=times, [:, 1]=pupil_area
+    lp: "pl.DataFrame"             # lightning-pose side-camera table
+    side_frame_times: ndarray      # side-camera frame timestamps
+
+
+def load_session_data(nwb_path: str, dt: float = DT) -> SessionData:
+    """Load every NWB stream a design might use, in one place (all S3 I/O).
+
+    Design-agnostic: the returned `SessionData` is consumed by `assemble_design`
+    (or any alternative builder), so swapping designs never re-reads from S3.
     """
     trials_df = lazynwb.read_nwb(nwb_path, "/intervals/trials")
 
@@ -129,198 +157,212 @@ def build_session_design(nwb_path: str, dt: float = DT) -> dict:
     trial_end_times: ndarray[tuple[int], Any] = (
         trials_df.select("stop_time").to_numpy().flatten()
     )
-
     task_start_time = trial_start_times[0]
     task_end_time = trial_end_times[-1]
-
     # Number of time bins on the y-grid (same grid as load_y). Computed from the
     # grid rather than from a unit so the design can be sized without I/O.
     T = int(np.floor((task_end_time - task_start_time) / dt))
 
-    trials_event_columns = {
-        'is_aud_target': {'window_start': 0, 'window_end': 0.1, 'n_basis': 2},
-        'is_aud_nontarget': {'window_start': 0, 'window_end': 0.1, 'n_basis': 2},
-        'is_vis_target': {'window_start': 0, 'window_end': 0.1, 'n_basis': 2},
-        'is_vis_nontarget': {'window_start': 0, 'window_end': 0.1, 'n_basis': 2},
-        'is_hit': {'window_start': 0.1, 'window_end': 1, 'n_basis': 9},
-        # 'is_miss': {'window_start': 0, 'window_end': 2, 'n_basis': 20},
-        # 'is_correct_reject': {'window_start': 0, 'window_end': 2, 'n_basis': 20},
-        # 'is_false_alarm': {'window_start': 0, 'window_end': 2, 'n_basis': 20},
-    }
-    predictors = []
-
-    # add event predictors for each trial event type
-    for col in trials_event_columns:
-        event_times = trials_df.filter(pl.col(col)).select("stim_start_time")["stim_start_time"].to_numpy()
-        window_start = trials_event_columns[col].get('window_start', 0)
-        window_end = trials_event_columns[col].get('window_end', 1)
-        n_basis = trials_event_columns[col].get('n_basis', 10)
-        predictors.append(
-            EventPredictor(col, event_times - task_start_time, window=(window_start, window_end), n_basis=n_basis, basis="cosine", gain_modulated=True)
-        )
-
-    # add licks
     lick_times = (
         lazynwb.scan_nwb(nwb_path, "/processing/behavior/licks")
-        .select('timestamps')
-        .collect()
-        .to_numpy()
+        .select('timestamps').collect().to_numpy().flatten()
     )
-    predictors.append(
-        EventPredictor("licks", lick_times.flatten() - task_start_time, window=(0, 0.2), n_basis=5, basis="cosine", gain_modulated=True)
-    )
-
-    # add rewards
     reward_times = (
         lazynwb.scan_nwb(nwb_path, "/processing/behavior/rewards")
-        .select('timestamps')
-        .collect()
-        .to_numpy()
+        .select('timestamps').collect().to_numpy().flatten()
     )
-    predictors.append(
-        EventPredictor("rewards", reward_times.flatten() - task_start_time, window=(-0.2, 1), n_basis=12, basis="cosine", gain_modulated=True)
-    )
-
-    # add continuous predictor for running speed
     running_speed = (
         lazynwb.scan_nwb(nwb_path, "/processing/behavior/running_speed")
-        .select("timestamps", "data")
-        .collect()
-        .to_numpy()
+        .select("timestamps", "data").collect().to_numpy()
     )
-    predictors.append(
-        ContinuousPredictor("running_speed",
-        values=running_speed[:,1],
-        window=(-1, 1),
-        n_basis=10, basis="cosine",
-        gain_modulated=False,
-        times=running_speed[:, 0] - task_start_time,
-        normalize='zscore'),
-    )
-
-    # add continuous predictor for pupil area
     pupil = (
         lazynwb.scan_nwb(nwb_path, "/processing/behavior/eye_tracking")
         .filter(~pl.col("pupil_is_bad_frame"))
-        .select("timestamps", "pupil_area")
-        .collect()
-        .to_numpy()
+        .select("timestamps", "pupil_area").collect().to_numpy()
     )
-    predictors.append(
-        ContinuousPredictor("pupil_area",
-        values=pupil[:,1],
-        window=(-1, 1),
-        n_basis=10, basis="cosine",
-        gain_modulated=False,
-        times=pupil[:, 0] - task_start_time,
-        normalize='zscore'),
-    )
-
-    # add continuous predictors for lightning pose features
-    lp_features = {'ear': 'ear_base_l', 'jaw': 'jaw', 'nose': 'nose_tip', 'whisker_pad': 'whisker_pad_l_side'}
-
-    lp = (
-        lazynwb.scan_nwb(nwb_path, "/processing/behavior/lp_side_camera")
-        .collect()
-    )
-
+    lp = lazynwb.scan_nwb(nwb_path, "/processing/behavior/lp_side_camera").collect()
     side_frame_times = (
         lazynwb.scan_nwb(nwb_path, "/acquisition/frametimes_side_camera")
-        .select('timestamps')
-        .collect()
-        .to_numpy()
+        .select('timestamps').collect().to_numpy().flatten()
+    )
+    # -1 for aud-rewarded trials, +1 for vis-rewarded trials
+    trial_context_labels = trials_df['is_vis_rewarded'].to_numpy().astype(int) * 2 - 1
+
+    return SessionData(
+        nwb_path=nwb_path, dt=dt,
+        task_start_time=task_start_time, task_end_time=task_end_time, T=T,
+        trials_df=trials_df,
+        trial_start_times=trial_start_times, trial_end_times=trial_end_times,
+        trial_context_labels=trial_context_labels,
+        lick_times=lick_times, reward_times=reward_times,
+        running_speed=running_speed, pupil=pupil,
+        lp=lp, side_frame_times=side_frame_times,
     )
 
+
+# The four stimulus-onset columns — used both as event predictors and to define
+# the peri-stimulus fit window. Kept module-level so variants can reuse it.
+STIM_COLUMNS = ['is_aud_target', 'is_aud_nontarget',
+                'is_vis_target', 'is_vis_nontarget']
+
+# Default trial-event predictors: {column: {window_start, window_end, n_basis}}.
+# Pass a modified copy to `default_predictors(event_columns=...)` to change
+# event windows / basis counts or add/drop events without copying the builder.
+DEFAULT_EVENT_COLUMNS = {
+    'is_aud_target': {'window_start': 0, 'window_end': 0.1, 'n_basis': 2},
+    'is_aud_nontarget': {'window_start': 0, 'window_end': 0.1, 'n_basis': 2},
+    'is_vis_target': {'window_start': 0, 'window_end': 0.1, 'n_basis': 2},
+    'is_vis_nontarget': {'window_start': 0, 'window_end': 0.1, 'n_basis': 2},
+    'is_hit': {'window_start': 0.1, 'window_end': 1, 'n_basis': 9},
+    # 'is_miss': {'window_start': 0, 'window_end': 2, 'n_basis': 20},
+    # 'is_correct_reject': {'window_start': 0, 'window_end': 2, 'n_basis': 20},
+    # 'is_false_alarm': {'window_start': 0, 'window_end': 2, 'n_basis': 20},
+}
+
+
+def default_predictors(data: SessionData, *, event_columns=None) -> tuple[list, list]:
+    """Build the default (predictors, gains) lists from loaded `SessionData`.
+
+    This is the part you customize when iterating. For common tweaks you don't
+    need to copy it at all:
+      - change event windows / basis counts, or add/drop trial events:
+        pass `event_columns=` a modified copy of `DEFAULT_EVENT_COLUMNS`;
+      - add/drop a continuous predictor: call this, edit the returned list.
+    For bigger structural changes, copy this body. All event/continuous times
+    are made task-relative here (minus task_start_time).
+
+    Returns (predictors, gains). The context gain modulates every event-column
+    predictor plus licks/rewards, so it tracks `event_columns` automatically.
+    """
+    task_start_time = data.task_start_time
+    T = data.T
+    trials_df = data.trials_df
+
+    trials_event_columns = DEFAULT_EVENT_COLUMNS if event_columns is None else event_columns
+    predictors = []
+    for col, spec in trials_event_columns.items():
+        event_times = trials_df.filter(pl.col(col)).select("stim_start_time")["stim_start_time"].to_numpy()
+        predictors.append(
+            EventPredictor(col, event_times - task_start_time,
+                           window=(spec.get('window_start', 0), spec.get('window_end', 1)),
+                           n_basis=spec.get('n_basis', 10), basis="cosine", gain_modulated=True)
+        )
+
+    # licks and rewards
+    predictors.append(
+        EventPredictor("licks", data.lick_times - task_start_time, window=(0, 0.2), n_basis=4, basis="cosine", gain_modulated=True)
+    )
+    predictors.append(
+        EventPredictor("rewards", data.reward_times - task_start_time, window=(-0.2, 1), n_basis=12, basis="cosine", gain_modulated=True)
+    )
+
+    # continuous behavioral predictors
+    running_speed = data.running_speed
+    predictors.append(
+        ContinuousPredictor("running_speed", values=running_speed[:, 1], window=(-1, 1),
+        n_basis=10, basis="cosine", gain_modulated=False,
+        times=running_speed[:, 0] - task_start_time, normalize='zscore')
+    )
+    pupil = data.pupil
+    predictors.append(
+        ContinuousPredictor("pupil_area", values=pupil[:, 1], window=(-1, 1),
+        n_basis=10, basis="cosine", gain_modulated=False,
+        times=pupil[:, 0] - task_start_time, normalize='zscore')
+    )
+
+    # lightning-pose face features (likelihood- and jitter-filtered)
+    lp_features = {'ear': 'ear_base_l', 'jaw': 'jaw', 'nose': 'nose_tip', 'whisker_pad': 'whisker_pad_l_side'}
+    lp = data.lp
+    side_frame_times = data.side_frame_times
     for feature_name, feature in lp_features.items():
         feature_x = lp.select(pl.col(feature + '_x')).to_numpy().flatten()
         feature_y = lp.select(pl.col(feature + '_y')).to_numpy().flatten()
         feature_likelihood = lp.select(pl.col(feature + "_likelihood")).to_numpy().flatten()
         feature_temporal_norm = lp.select(pl.col(feature + "_temporal_norm")).to_numpy().flatten()
-        feature_times = side_frame_times.flatten()
-
-        mask = (feature_likelihood > 0.98) & (feature_temporal_norm < np.nanmean(feature_temporal_norm) + 3*np.nanstd(feature_temporal_norm))
-        feature_euclidean = np.sqrt(feature_x**2 + feature_y**2)
-
+        mask = (feature_likelihood > 0.98) & (feature_temporal_norm < np.nanmean(feature_temporal_norm) + 3 * np.nanstd(feature_temporal_norm))
+        feature_euclidean = np.sqrt(feature_x ** 2 + feature_y ** 2)
         predictors.append(
-            ContinuousPredictor(feature_name,
-            values=feature_euclidean[mask],
-            window=(-1, 1),
-            n_basis=10, basis="cosine",
-            gain_modulated=False,
-            times=feature_times[mask] - task_start_time,
-            normalize='zscore'),
+            ContinuousPredictor(feature_name, values=feature_euclidean[mask], window=(-1, 1),
+            n_basis=10, basis="cosine", gain_modulated=False,
+            times=side_frame_times[mask] - task_start_time, normalize='zscore')
         )
 
-    trial_context_labels = trials_df['is_vis_rewarded'].to_numpy().astype(int)*2 - 1  # -1 for aud trials, +1 for vis trials
-
+    # context baseline + slow drift
+    trial_context_labels = data.trial_context_labels  # -1 aud-rewarded, +1 vis-rewarded
     predictors.append(
-        ContinuousPredictor("context_baseline",
-        values=trial_context_labels,
-        window=(0, 0),
-        n_basis=1,
-        basis="cosine",
-        gain_modulated=False,
-        times=trial_start_times - task_start_time,
-        normalize='none'),
+        ContinuousPredictor("context_baseline", values=trial_context_labels, window=(0, 0),
+        n_basis=1, basis="cosine", gain_modulated=False,
+        times=data.trial_start_times - task_start_time, normalize='none')
+    )
+    predictors.append(
+        ContinuousPredictor("time", values=np.arange(T) / T, window=(0, 0),
+        n_basis=1, basis="cosine", gain_modulated=False, normalize='zscore')
     )
 
-    predictors.append(
-        ContinuousPredictor("time",
-        values=np.arange(T)/T,
-        window=(0, 0),
-        n_basis=1,
-        basis="cosine",
-        gain_modulated=False,
-        normalize='zscore'),
-    )
-
-    predictors_with_gain = list(trials_event_columns.keys()) + ["licks", "rewards"]
-
-    context_gain = trial_context_labels
+    # context gain modulates the trial-event predictors plus licks/rewards
     gains = [
-        GainModulator("context", values=context_gain, modulates=predictors_with_gain),
+        GainModulator("context", values=trial_context_labels,
+                      modulates=list(trials_event_columns.keys()) + ["licks", "rewards"]),
     ]
+    return predictors, gains
 
-    model = BilinearGLM(
-        predictors=predictors,
-        gains=gains,
-        dt=dt,
-        kernel_regularizer="ridge",      # ridge is fast for the demo; lasso also works
-        alphas=np.logspace(-3, 3, 25),
-        # spike_history = True
-        # cv_folds=None (default): RidgeCV uses GCV/LOO via SVD — fast
-        # cv_folds=5: k-fold CV — needed for LassoCV, slow for Ridge
-    )
+
+def finalize_design(data: SessionData, predictors: list, gains: list, *,
+                    kernel_regularizer: str = "ridge",
+                    alphas=None, stim_columns=STIM_COLUMNS,
+                    stim_fit_window=STIM_FIT_WINDOW, **model_kwargs) -> dict:
+    """Wrap a (predictors, gains) set into the design dict every fit consumes.
+
+    This is the boilerplate you should NOT copy into each variant: it builds the
+    model, the trial index, precomputes the design, and builds the peri-stimulus
+    `fit_mask`. A variant typically reads as::
+
+        def my_design(data):
+            predictors, gains = default_predictors(data)
+            ...  # tweak predictors / gains
+            return finalize_design(data, predictors, gains)
+
+    `kernel_regularizer`, `alphas`, and any extra `model_kwargs` (e.g.
+    spike_history, cv_folds) pass straight through to `BilinearGLM`.
+    `stim_columns` / `stim_fit_window` define the fit mask; pass
+    `stim_fit_window=None` to fit all bins.
+    """
+    dt, T = data.dt, data.T
+    task_start_time = data.task_start_time
+    if alphas is None:
+        alphas = np.logspace(-3, 3, 25)
+
+    model = BilinearGLM(predictors=predictors, gains=gains, dt=dt,
+                        kernel_regularizer=kernel_regularizer, alphas=alphas,
+                        **model_kwargs)
 
     trial_idx = make_trial_idx(
-        trial_start_times - task_start_time,
-        np.append(trial_start_times[1:], task_end_time) - task_start_time,
+        data.trial_start_times - task_start_time,
+        np.append(data.trial_start_times[1:], data.task_end_time) - task_start_time,
         dt,
     )
 
     # Precompute the design ONCE for the session — every cell shares the same
     # predictors / trial structure, so the per-cell convolutions are redundant.
-    # fit_summary then skips that work for each cell.
     t0 = time.perf_counter()
     design = model.precompute_design(trial_idx, T=T)
     print(f"precompute_design took {time.perf_counter() - t0:.2f} s")
 
-    # Restrict fitting/scoring to peri-stimulus windows. The mask marks bins
-    # within STIM_FIT_WINDOW of any of the four stimulus onsets; the design is
-    # still built over the full session above so kernels don't leak at edges.
-    stim_columns = ['is_aud_target', 'is_aud_nontarget',
-                    'is_vis_target', 'is_vis_nontarget']
-    stim_onset_times = (
-        trials_df.filter(pl.any_horizontal(pl.col(c) for c in stim_columns))
-        .select("stim_start_time")["stim_start_time"]
-        .drop_nulls()
-        .to_numpy()
-    )
-    fit_mask = windows_mask(stim_onset_times - task_start_time, T, dt,
-                            window=STIM_FIT_WINDOW)
-    print(f"fit_mask keeps {fit_mask.sum()}/{T} bins "
-          f"({100 * fit_mask.mean():.1f}%) within {STIM_FIT_WINDOW} s of "
-          f"{len(stim_onset_times)} stimulus onsets")
+    # Restrict fitting/scoring to peri-stimulus windows (None => fit all bins).
+    # The design is still built over the full session so kernels don't leak.
+    if stim_fit_window is None:
+        fit_mask = None
+        print("fit_mask: None — fitting all bins")
+    else:
+        stim_onset_times = (
+            data.trials_df.filter(pl.any_horizontal(pl.col(c) for c in stim_columns))
+            .select("stim_start_time")["stim_start_time"].drop_nulls().to_numpy()
+        )
+        fit_mask = windows_mask(stim_onset_times - task_start_time, T, dt,
+                                window=stim_fit_window)
+        print(f"fit_mask keeps {fit_mask.sum()}/{T} bins "
+              f"({100 * fit_mask.mean():.1f}%) within {stim_fit_window} s of "
+              f"{len(stim_onset_times)} stimulus onsets")
 
     return {
         "model": model,
@@ -328,9 +370,29 @@ def build_session_design(nwb_path: str, dt: float = DT) -> dict:
         "design": design,
         "fit_mask": fit_mask,
         "task_start_time": task_start_time,
-        "task_end_time": task_end_time,
+        "task_end_time": data.task_end_time,
         "T": T,
     }
+
+
+def assemble_design(data: SessionData) -> dict:
+    """The default design: `default_predictors` + `finalize_design`.
+
+    To try an alternative, write your own builder (typically in
+    compare_models.py) that calls `default_predictors`/`finalize_design`, and
+    pass it as a variant's `design_fn` — don't edit this.
+    """
+    predictors, gains = default_predictors(data)
+    return finalize_design(data, predictors, gains)
+
+
+def build_session_design(nwb_path: str, dt: float = DT) -> dict:
+    """Load a session and build the default design — the entry point used by
+    `fit_session` / SLURM. Thin wrapper over `load_session_data` +
+    `assemble_design`; to try an alternative design, swap `assemble_design` for
+    your own builder (see compare_models.py) rather than editing this.
+    """
+    return assemble_design(load_session_data(nwb_path, dt=dt))
 
 
 def fit_session(nwb_path: str, session_id: str, output_dir: pathlib.Path, *,

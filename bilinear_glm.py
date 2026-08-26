@@ -1194,7 +1194,8 @@ class BilinearGLM:
     def cross_val_score(self, y: np.ndarray, trial_idx: np.ndarray, *,
                         fit_mask: Optional[np.ndarray] = None,
                         gap_history=False,
-                        n_folds: int = 5, max_iter: int = 100,
+                        n_folds: int = 5, fold_seed: Optional[int] = None,
+                        max_iter: int = 100,
                         tol: float = 1e-3, patience: int = 3,
                         verbose: bool = False) -> float:
         """Trial-held-out cross-validated R².
@@ -1202,11 +1203,16 @@ class BilinearGLM:
         `y` is the (T,) target; `trial_idx` is the (T,) bin-to-trial map used
         to define the folds (see `BilinearGLM` class docstring).
 
-        Trials are partitioned into `n_folds` contiguous groups. For each fold
-        the model is refit from scratch on the remaining trials; the full
-        convolution is computed over all time bins so that kernel windows that
-        span trial boundaries are handled correctly, but only rows belonging to
-        training trials enter the ALS solver.
+        Trials are partitioned into `n_folds` groups. By default the groups are
+        contiguous blocks of trials (in trial-id order); pass `fold_seed=<int>`
+        to instead assign whole trials to folds at random (reproducibly). Random
+        folds reduce the drift-driven catastrophic-fold blowups but interpolate
+        across slow drift — see the README note on CV schemes. Whole trials are
+        always kept together regardless. For each fold the model is refit from
+        scratch on the remaining trials; the full convolution is computed over
+        all time bins so that kernel windows that span trial boundaries are
+        handled correctly, but only rows belonging to training trials enter the
+        ALS solver.
 
         If `fit_mask` is provided (or one was stored at fit time), both the
         training and test rows are restricted to its True bins — convolutions
@@ -1262,6 +1268,8 @@ class BilinearGLM:
         gain_t = self._gain_per_t(T, trial_idx)
 
         trials = np.unique(trial_idx)
+        if fold_seed is not None:
+            trials = np.random.default_rng(fold_seed).permutation(trials)
         folds = np.array_split(trials, n_folds)
 
         cv_scores = []
@@ -1314,7 +1322,8 @@ class BilinearGLM:
                      remove_predictors: Sequence[str] = (),
                      fit_mask: Optional[np.ndarray] = None,
                      design: Optional[dict] = None,
-                     n_folds: int = 5, gap_history=False,
+                     n_folds: int = 5, fold_seed: Optional[int] = None,
+                     gap_history=False,
                      max_iter: int = 100, tol: float = 1e-3,
                      patience: int = 3, verbose: bool = False) -> dict:
         """Fit + in-sample R² + CV R² + ΔR² in one shared pass.
@@ -1338,7 +1347,7 @@ class BilinearGLM:
         y, trial_idx : as in ``fit``.
         remove_gains, remove_predictors : as in ``delta_r2``. If both are
             empty, the ΔR² fields of the returned dict are None.
-        fit_mask, n_folds, gap_history : as in ``cross_val_score``.
+        fit_mask, n_folds, fold_seed, gap_history : as in ``cross_val_score``.
         design : optional precomputed design dict (see
             ``precompute_design``). When fitting many cells against the
             same session, build it once and pass it here to skip the
@@ -1417,6 +1426,8 @@ class BilinearGLM:
         # --- CV pass: full R² and (optional) ΔR² in the same folds ----------
         compute_delta = bool(remove_gains) or bool(remove_predictors)
         trials = np.unique(trial_idx)
+        if fold_seed is not None:
+            trials = np.random.default_rng(fold_seed).permutation(trials)
         folds = np.array_split(trials, n_folds)
         cv_r2 = []
         cv_delta = [] if compute_delta else None
