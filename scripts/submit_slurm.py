@@ -5,11 +5,16 @@ block below. Use ``--dry-run`` to inspect commands before submission.
 """
 
 import argparse
+import json
+from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 
 import polars as pl
 from dr_datacube import get_session_ids_from_github, list_nwb_sources
 from simple_slurm import Slurm
+
+from gain_glm.dynamic_routing import DEFAULT_DROPOUTS, MODELS
 
 REPO_DIR = Path(__file__).resolve().parents[1]
 PYTHON = str(REPO_DIR / ".venv/bin/python")
@@ -48,22 +53,41 @@ def slurm_job(session_id: str) -> Slurm:
     return Slurm(**options)
 
 
+def save_run_params(
+    output_dir: Path,
+    args: argparse.Namespace,
+    session_ids: list[str],
+) -> None:
+    params = {
+        "output_dir": str(output_dir),
+        "arguments": vars(args),
+        "session_ids": session_ids,
+        "model": asdict(MODELS[args.model]),
+        "dropouts": [asdict(dropout) for dropout in DEFAULT_DROPOUTS],
+    }
+    with (output_dir / "run_params.json").open("w") as stream:
+        json.dump(params, stream, indent=2)
+        stream.write("\n")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--unit-limit", type=int)
-    parser.add_argument("--model", default="default")
+    parser.add_argument("--model", choices=MODELS, default="default")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    run_output_dir = Path(OUTPUT_DIR) / datetime.now().astimezone().strftime("%m%d%y")
+    run_output_dir.mkdir(parents=True, exist_ok=True)
     table = sessions().head(args.limit) if args.limit else sessions()
     for row in table.iter_rows(named=True):
         command = (
             f"{PYTHON} -m gain_glm.batch "
             f"--nwb-path {row['nwb_path']} --session-id {row['session_id']} "
-            f"--output-dir {OUTPUT_DIR} --model {args.model}"
+            f"--output-dir {run_output_dir} --model {args.model}"
         )
         if args.unit_limit:
             command += f" --limit {args.unit_limit}"
@@ -75,6 +99,8 @@ def main() -> None:
             print(command)
         else:
             print(f"submitted {row['session_id']}: {job.sbatch(command)}")
+    if not args.dry_run:
+        save_run_params(run_output_dir, args, table["session_id"].to_list())
 
 
 if __name__ == "__main__":
