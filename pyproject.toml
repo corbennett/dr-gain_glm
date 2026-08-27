@@ -1,19 +1,33 @@
 [project]
 name = "gain-glm"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.2.0"
+description = "Declarative bilinear encoding models with trial-by-trial gain modulation"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "numpy>=2.0.2",
+    "scikit-learn>=1.6.1",
+]
+
+[project.optional-dependencies]
+dynamic-routing = [
     "hdmf-zarr>=0.12.0",
     "joblib>=1.3",
     "lazynwb==1.0.0dev3",
-    "matplotlib>=3.9.4",
-    "numpy>=2.0.2",
-    "pandas>=2.3.3",
     "polars>=1.0.0",
-    "scikit-learn>=1.6.1",
     "simple-slurm>=0.3.0",
     "threadpoolctl>=3.0.0",
     "universal-pathlib>=0.2.0",
 ]
+plot = ["matplotlib>=3.9.4"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+gain-glm-fit = "gain_glm.dynamic_routing:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
