@@ -19,11 +19,12 @@ PARTITION = None
 CPUS = 8
 MEMORY = "32G"
 WALLTIME = "4:00:00"
+DATACUBE_VERSION = "v0.0.289"
 
 
 def sessions() -> pl.DataFrame:
     nwb_dir = upath.UPath(
-        "s3://aind-scratch-data/dynamic-routing/cache/nwb/v0.0.272/", anon=True
+        f"s3://aind-scratch-data/dynamic-routing/cache/nwb/{DATACUBE_VERSION}/", anon=True
     )
     paths = pl.DataFrame(
         {

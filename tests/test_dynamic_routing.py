@@ -59,6 +59,10 @@ class DynamicRoutingAdapterTests(unittest.TestCase):
         np.testing.assert_array_equal(data.trial_index[:10], 0)
         np.testing.assert_array_equal(data.trial_index[10:], 1)
         np.testing.assert_array_equal(data.trial_values["trial_context"], [-1, 1])
+        context_baseline = data.signals["context_baseline"]
+        self.assertIsNone(context_baseline.times)
+        np.testing.assert_array_equal(context_baseline.values[:10], -1)
+        np.testing.assert_array_equal(context_baseline.values[10:], 1)
 
     def test_default_model_prepares_without_builder_functions(self):
         prepared = prepare(self.make_session(), DEFAULT_MODEL)

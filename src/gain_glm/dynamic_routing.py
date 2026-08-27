@@ -119,7 +119,7 @@ BEHAVIOR_PREDICTORS = (
         "context_baseline",
         window=(0, 0),
         n_basis=1,
-        groups=("context", "nuisance"),
+        groups=("context",),
     ),
     Signal(
         "time",
@@ -178,7 +178,8 @@ MODELS: Mapping[str, ModelSpec] = {
         ALL_RESPONSE_MODEL,
     )
 }
-DEFAULT_DROPOUTS = (Dropout.gain("context"),)
+DEFAULT_DROPOUTS = (Dropout.gain("context"),
+                    Dropout.predictors('context_baseline'))
 
 
 @dataclass(frozen=True)
@@ -327,7 +328,9 @@ def model_data(session: SessionData) -> ModelData:
         "jaw": _pose_signal(session, "jaw"),
         "nose": _pose_signal(session, "nose_tip"),
         "whisker_pad": _pose_signal(session, "whisker_pad_l_side"),
-        "context_baseline": TimedSignal(session.trial_context, start_relative),
+        # Additive context baseline: hold each trial's label constant over all
+        # of its bins, with an instantaneous step at the trial boundary.
+        "context_baseline": TimedSignal(session.trial_context[trial_index]),
         "time": TimedSignal(np.arange(session.n_time) / session.n_time),
     }
     return ModelData(
