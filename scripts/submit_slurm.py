@@ -8,7 +8,7 @@ import argparse
 from pathlib import Path
 
 import polars as pl
-import upath
+from dr_datacube import get_session_ids_from_github, list_nwb_sources
 from simple_slurm import Slurm
 
 REPO_DIR = Path(__file__).resolve().parents[1]
@@ -19,41 +19,19 @@ PARTITION = None
 CPUS = 8
 MEMORY = "32G"
 WALLTIME = "4:00:00"
-DATACUBE_VERSION = "v0.0.289"
 
 
 def sessions() -> pl.DataFrame:
-    nwb_dir = upath.UPath(
-        f"s3://aind-scratch-data/dynamic-routing/cache/nwb/{DATACUBE_VERSION}/", anon=True
-    )
+    good_session_ids = set(get_session_ids_from_github("brainwide"))
     paths = pl.DataFrame(
         {
-            "nwb_path": path.as_posix(),
-            "session_id": path.stem,
+            "nwb_path": nwb_path,
+            "session_id": nwb_path.rsplit("/", 1)[-1].split(".", 1)[0],
         }
-        for path in nwb_dir.iterdir()
-        if path.suffix == ".nwb"
+        for nwb_path in list_nwb_sources()
+        if nwb_path.rsplit("/", 1)[-1].split(".", 1)[0] in good_session_ids
     )
-    return (
-        pl.read_parquet(
-            "s3://aind-scratch-data/dynamic-routing/session_metadata/session_table.parquet",
-            storage_options={"skip_signature": "true"},
-        )
-        .filter(
-            "is_good_behavior",
-            pl.col("project") == "DynamicRouting",
-            "is_ephys",
-            ~pl.col("is_naive"),
-            ~pl.col("is_context_naive"),
-            "is_task",
-            ~pl.col("is_opto_perturbation"),
-            ~pl.col("is_injection_perturbation"),
-            ~pl.col("is_opto_control"),
-            ~pl.col("is_injection_control"),
-        )
-        .join(paths, on="session_id", how="inner")
-        .select("session_id", "nwb_path")
-    )
+    return paths.select("session_id", "nwb_path")
 
 
 def slurm_job(session_id: str) -> Slurm:
