@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 import polars as pl
-from dr_datacube import get_session_ids_from_github, list_nwb_sources
+from dr_datacube import get_session_ids_from_github, list_nwb_sources, datacube_config
 from simple_slurm import Slurm
 
 from gain_glm.dynamic_routing import DEFAULT_DROPOUTS, MODELS
@@ -25,6 +25,7 @@ CPUS = 8
 MEMORY = "32G"
 WALLTIME = "4:00:00"
 
+datacube_config.use_cache=True
 
 def sessions() -> pl.DataFrame:
     good_session_ids = set(get_session_ids_from_github("brainwide"))
