@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Mapping, Sequence
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from .data import ModelData, TimedSignal
-from .model import Event, FitConfig, History, ModelSpec, Signal
+from .model import Event, FitConfig, FittedModel, History, ModelSpec, Signal
+
+if TYPE_CHECKING:
+    from .evaluation import CVConfig, Dropout, EvaluationResult
 
 
 def linear_cosine_basis(n_basis: int, n_lag_bins: int) -> np.ndarray:
@@ -50,6 +54,8 @@ def log_cosine_basis(
 
 
 def make_basis(name: str, n_basis: int, n_lag_bins: int) -> np.ndarray:
+    if n_lag_bins == 1 and n_basis != 1:
+        raise ValueError("a one-bin kernel window requires n_basis=1")
     if name == "cosine":
         return linear_cosine_basis(n_basis, n_lag_bins)
     if name == "log_cosine":
@@ -204,7 +210,9 @@ class PreparedDesign:
         history = [p for p in self.spec.predictors if isinstance(p, History)]
         return max((int(self.lags[p.name].max()) for p in history), default=0)
 
-    def blocks_for_target(self, target: np.ndarray | None = None) -> dict[str, np.ndarray]:
+    def blocks_for_target(
+        self, target: np.ndarray | None = None
+    ) -> dict[str, np.ndarray]:
         blocks = dict(self.base_blocks)
         history_terms = [p for p in self.spec.predictors if isinstance(p, History)]
         if history_terms:
@@ -227,7 +235,7 @@ class PreparedDesign:
         *,
         config: FitConfig | None = None,
         mask: np.ndarray | None = None,
-    ):
+    ) -> FittedModel:
         from ._solver import fit_model
 
         return fit_model(self, y, config=config, mask=mask)
@@ -237,16 +245,18 @@ class PreparedDesign:
         y: np.ndarray,
         *,
         fit: FitConfig | None = None,
-        cv=None,
-        dropouts: Sequence | None = None,
+        cv: CVConfig | None = None,
+        dropouts: Sequence[Dropout] | None = None,
         mask: np.ndarray | None = None,
-    ):
+    ) -> EvaluationResult:
         from .evaluation import evaluate
 
         return evaluate(self, y, fit=fit, cv=cv, dropouts=dropouts, mask=mask)
 
 
-def _parameter_layout(spec: ModelSpec, bases: Mapping[str, np.ndarray]) -> ParameterLayout:
+def _parameter_layout(
+    spec: ModelSpec, bases: Mapping[str, np.ndarray]
+) -> ParameterLayout:
     beta_slices: dict[str, slice] = {}
     beta_start = 0
     for predictor in spec.predictors:
@@ -310,9 +320,11 @@ def compile_design(
                 raise KeyError(
                     f"event source {predictor.source!r} required by {predictor.name!r} is missing"
                 )
-            series = _event_series(
-                data.events[predictor.source], data.dt, data.n_time
-            )
+            if not np.all(np.isfinite(data.events[predictor.source])):
+                raise ValueError(
+                    f"event source {predictor.source!r} contains non-finite times"
+                )
+            series = _event_series(data.events[predictor.source], data.dt, data.n_time)
             blocks[predictor.name] = _design_block(
                 series, predictor_lags, predictor_basis
             )
@@ -338,8 +350,15 @@ def compile_design(
                 f"gain source {gain.source!r} has {values.size} values for "
                 f"{data.n_trials} indexed trials"
             )
+        if not np.all(np.isfinite(values[: data.n_trials])):
+            raise ValueError(f"gain source {gain.source!r} contains non-finite values")
         gain_by_time[gain.name] = values[data.trial_index]
 
+    for mapping in (lags, bases, blocks, gain_by_time):
+        for values in mapping.values():
+            values.setflags(write=False)
+    mask = mask.copy()
+    mask.setflags(write=False)
     return PreparedDesign(
         spec=spec,
         data=data,

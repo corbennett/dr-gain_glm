@@ -20,10 +20,18 @@ dynamic-routing = [
     "universal-pathlib>=0.2.0",
 ]
 plot = ["matplotlib>=3.9.4"]
-dev = ["pytest>=8.0"]
+dev = [
+    "hdmf-zarr>=0.12.0",
+    "joblib>=1.3",
+    "lazynwb==1.0.0dev3",
+    "polars>=1.0.0",
+    "pytest>=8.0",
+    "ruff>=0.12",
+    "threadpoolctl>=3.0.0",
+]
 
 [project.scripts]
-gain-glm-fit = "gain_glm.dynamic_routing:main"
+gain-glm-fit = "gain_glm.batch:main"
 
 [build-system]
 requires = ["setuptools>=68"]

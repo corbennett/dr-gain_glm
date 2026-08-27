@@ -6,7 +6,7 @@ fit returns a new :class:`gain_glm.model.FittedModel`.
 
 from __future__ import annotations
 
-from typing import Mapping, Sequence
+from collections.abc import Mapping, Sequence
 
 import numpy as np
 from sklearn.linear_model import Lasso, LassoCV, Ridge, RidgeCV
@@ -43,9 +43,7 @@ def _kernel_design(
         if not predictor.gains:
             design[:, sl] = block
             continue
-        weight = np.full(
-            n_time, gain[prepared.layout.gain_offsets[predictor.name]]
-        )
+        weight = np.full(n_time, gain[prepared.layout.gain_offsets[predictor.name]])
         for gain_name in predictor.gains:
             index = prepared.layout.gain_coefficients[(gain_name, predictor.name)]
             weight += gain[index] * gain_by_time[gain_name]
@@ -79,9 +77,7 @@ def _normalize_kernels(
         beta[sl] /= norm
         gain[prepared.layout.gain_offsets[predictor.name]] *= norm
         for gain_name in predictor.gains:
-            gain[
-                prepared.layout.gain_coefficients[(gain_name, predictor.name)]
-            ] *= norm
+            gain[prepared.layout.gain_coefficients[(gain_name, predictor.name)]] *= norm
 
 
 def _gain_design(
@@ -96,9 +92,7 @@ def _gain_design(
     for predictor in prepared.spec.predictors:
         if not predictor.gains:
             continue
-        design[:, prepared.layout.gain_offsets[predictor.name]] = drives[
-            predictor.name
-        ]
+        design[:, prepared.layout.gain_offsets[predictor.name]] = drives[predictor.name]
         for gain_name in predictor.gains:
             index = prepared.layout.gain_coefficients[(gain_name, predictor.name)]
             design[:, index] = gain_by_time[gain_name] * drives[predictor.name]
@@ -210,9 +204,7 @@ def predict_parameters(
         if not predictor.gains:
             prediction += drive
             continue
-        weight = np.full(
-            drive.size, gain[prepared.layout.gain_offsets[predictor.name]]
-        )
+        weight = np.full(drive.size, gain[prepared.layout.gain_offsets[predictor.name]])
         for gain_name in predictor.gains:
             index = prepared.layout.gain_coefficients[(gain_name, predictor.name)]
             weight += gain[index] * gain_by_time[gain_name]
@@ -261,12 +253,11 @@ def fit_state(
     gain_alpha = config.gain_alpha
     kernel_solver = None
     variable_indices = [
-        index
-        for index in prepared.layout.gain_coefficients.values()
-        if retained[index]
+        index for index in prepared.layout.gain_coefficients.values() if retained[index]
     ]
     previous = gain[variable_indices].copy()
     stable = 0
+    converged = False
     iterations: list[Iteration] = []
 
     for iteration in range(config.max_iter):
@@ -338,9 +329,7 @@ def fit_state(
             prepared, blocks, gain_by_time, beta, gain, intercept
         )
         mse = float(np.mean((y - prediction) ** 2))
-        iterations.append(
-            Iteration(iteration, mse, float(kernel_alpha), gain_alpha)
-        )
+        iterations.append(Iteration(iteration, mse, float(kernel_alpha), gain_alpha))
         if config.verbose:
             print(
                 f"iter {iteration:3d} mse={mse:.6g} "
@@ -348,11 +337,13 @@ def fit_state(
             )
 
         if not variable_indices:
+            converged = True
             break
         current = gain[variable_indices]
         if np.max(np.abs(current - previous)) <= config.tol:
             stable += 1
             if stable >= config.patience:
+                converged = True
                 break
         else:
             stable = 0
@@ -379,13 +370,15 @@ def fit_state(
             final.kernel_alpha,
             final_gain_alpha,
         )
-    return FitState(beta, gain, intercept, tuple(iterations))
+    return FitState(beta, gain, intercept, tuple(iterations), converged)
 
 
 def _fit_mask(prepared: PreparedDesign, mask: np.ndarray | None) -> np.ndarray:
     used = prepared.fit_mask if mask is None else np.asarray(mask, dtype=bool).ravel()
     if used.size != prepared.data.n_time:
-        raise ValueError(f"mask has length {used.size}, expected {prepared.data.n_time}")
+        raise ValueError(
+            f"mask has length {used.size}, expected {prepared.data.n_time}"
+        )
     if not used.any():
         raise ValueError("mask selects no bins")
     return used
@@ -404,6 +397,8 @@ def fit_model(
         raise ValueError(
             f"target has length {values.size}, expected {prepared.data.n_time}"
         )
+    if not np.all(np.isfinite(values)):
+        raise ValueError("target contains non-finite values")
     settings = FitConfig() if config is None else config
     used = _fit_mask(prepared, mask)
     blocks = prepared.blocks_for_target(values if prepared.has_history else None)

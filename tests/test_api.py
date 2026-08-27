@@ -8,6 +8,7 @@ from gain_glm import (
     Dropout,
     FitConfig,
     Gain,
+    History,
     ModelData,
     ModelSpec,
     Signal,
@@ -66,6 +67,7 @@ class SpecificationTests(unittest.TestCase):
         changed = original.replace("x", window=(-0.1, 0.1), n_basis=3)
 
         self.assertEqual(original.predictor_names, ("x", "nuisance"))
+        self.assertEqual(original.group_members("behavior"), ("nuisance",))
         self.assertEqual(variant.predictor_names, ("x",))
         self.assertEqual(variant.name, "task_only")
         self.assertEqual(changed.predictor("x").window, (-0.1, 0.1))
@@ -86,6 +88,13 @@ class SpecificationTests(unittest.TestCase):
         self.assertEqual(gain.refit, "gains")
         self.assertEqual(behavior.predictors, ("nuisance",))
         self.assertEqual(behavior.refit, "full")
+
+        mixed = Dropout.terms(
+            "task_context", groups=("task",), gains=("context",)
+        ).resolve(prepared)
+        self.assertEqual(mixed.predictors, ("x",))
+        self.assertEqual(mixed.gains, ("context",))
+        self.assertEqual(mixed.refit, "full")
 
 
 class EvaluationTests(unittest.TestCase):
@@ -145,11 +154,11 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(result.dropouts["context"].dropout.refit, "full")
 
     def test_evaluation_is_reproducible_and_result_is_typed(self):
-        kwargs = dict(
-            fit=self.fit,
-            cv=CVConfig(folds=3, seed=7),
-            dropouts=[Dropout.gain("context")],
-        )
+        kwargs = {
+            "fit": self.fit,
+            "cv": CVConfig(folds=3, seed=7),
+            "dropouts": [Dropout.gain("context")],
+        }
         first = self.prepared.evaluate(self.y, **kwargs)
         second = self.prepared.evaluate(self.y, **kwargs)
 
@@ -159,6 +168,40 @@ class EvaluationTests(unittest.TestCase):
             second.dropouts["context"].delta_r2_per_fold,
         )
         self.assertIn("context", first.to_dict()["dropouts"])
+
+    def test_history_is_explicit_and_cv_can_gap_boundaries(self):
+        rng = np.random.default_rng(12)
+        trial_index = np.repeat(np.arange(8), 12)
+        x = rng.normal(size=trial_index.size)
+        y = rng.normal(size=trial_index.size)
+        data = ModelData(dt=0.1, trial_index=trial_index, signals={"x": x})
+        spec = ModelSpec(
+            (
+                Signal("x", window=(0, 0), n_basis=1),
+                History(window=(0.1, 0.3), n_basis=3),
+            ),
+            name="history",
+        )
+        prepared = compile_design(spec, data)
+        result = prepared.evaluate(
+            y,
+            fit=FitConfig(kernel_alpha=1.0, max_iter=3),
+            cv=CVConfig(folds=4, gap_history=True),
+        )
+        self.assertEqual(result.cv.r2_per_fold.shape, (4,))
+
+    def test_linear_model_converges_in_one_solve(self):
+        rng = np.random.default_rng(22)
+        trial_index = np.repeat(np.arange(4), 10)
+        x = rng.normal(size=trial_index.size)
+        data = ModelData(dt=0.1, trial_index=trial_index, signals={"x": x})
+        spec = ModelSpec((Signal("x", window=(0, 0), n_basis=1),))
+        fitted = compile_design(spec, data).fit(
+            0.5 + 2 * x,
+            config=FitConfig(kernel_alpha=1e-8, max_iter=1),
+        )
+        self.assertEqual(fitted.n_iter, 1)
+        self.assertTrue(fitted.converged)
 
 
 if __name__ == "__main__":

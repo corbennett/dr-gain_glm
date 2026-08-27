@@ -7,8 +7,10 @@ model is prepared against :class:`gain_glm.data.ModelData`.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace as dataclass_replace
-from typing import TYPE_CHECKING, Literal, Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from dataclasses import replace as dataclass_replace
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 
@@ -35,7 +37,9 @@ class Event:
     groups: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "source", self.name if self.source is None else self.source)
+        object.__setattr__(
+            self, "source", self.name if self.source is None else self.source
+        )
         object.__setattr__(self, "gains", _names(self.gains))
         object.__setattr__(self, "groups", _names(self.groups))
         _validate_predictor(self)
@@ -57,7 +61,9 @@ class Signal:
     outlier_zscore: float | None = 5.0
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "source", self.name if self.source is None else self.source)
+        object.__setattr__(
+            self, "source", self.name if self.source is None else self.source
+        )
         object.__setattr__(self, "gains", _names(self.gains))
         object.__setattr__(self, "groups", _names(self.groups))
         _validate_predictor(self)
@@ -65,6 +71,8 @@ class Signal:
             raise ValueError("align must be 'interp' or 'bin'")
         if self.normalize not in {"none", "center", "zscore"}:
             raise ValueError("normalize must be 'none', 'center', or 'zscore'")
+        if self.outlier_zscore is not None and self.outlier_zscore <= 0:
+            raise ValueError("outlier_zscore must be positive or None")
 
 
 @dataclass(frozen=True)
@@ -91,9 +99,7 @@ def _validate_predictor(predictor: Predictor) -> None:
     if not predictor.name:
         raise ValueError("predictor names cannot be empty")
     if len(predictor.window) != 2 or predictor.window[1] < predictor.window[0]:
-        raise ValueError(
-            f"invalid window for {predictor.name!r}: {predictor.window!r}"
-        )
+        raise ValueError(f"invalid window for {predictor.name!r}: {predictor.window!r}")
     if predictor.n_basis < 1:
         raise ValueError(f"n_basis must be positive for {predictor.name!r}")
     if len(set(predictor.gains)) != len(predictor.gains):
@@ -111,7 +117,9 @@ class Gain:
     def __post_init__(self) -> None:
         if not self.name:
             raise ValueError("gain names cannot be empty")
-        object.__setattr__(self, "source", self.name if self.source is None else self.source)
+        object.__setattr__(
+            self, "source", self.name if self.source is None else self.source
+        )
         object.__setattr__(self, "groups", _names(self.groups))
 
 
@@ -137,6 +145,7 @@ class ModelSpec:
             raise ValueError("gain names must be unique")
 
         known_gains = set(gain_names)
+        used_gains: set[str] = set()
         for predictor in self.predictors:
             unknown = set(predictor.gains) - known_gains
             if unknown:
@@ -144,6 +153,10 @@ class ModelSpec:
                     f"predictor {predictor.name!r} references unknown gains: "
                     f"{sorted(unknown)}"
                 )
+            used_gains.update(predictor.gains)
+        unused = known_gains - used_gains
+        if unused:
+            raise ValueError(f"gains are not used by any predictor: {sorted(unused)}")
 
     @property
     def predictor_names(self) -> tuple[str, ...]:
@@ -152,6 +165,14 @@ class ModelSpec:
     @property
     def gain_names(self) -> tuple[str, ...]:
         return tuple(g.name for g in self.gains)
+
+    @property
+    def group_names(self) -> tuple[str, ...]:
+        return tuple(sorted({group for p in self.predictors for group in p.groups}))
+
+    def group_members(self, group: str) -> tuple[str, ...]:
+        """Predictor names carrying ``group``, in model declaration order."""
+        return tuple(p.name for p in self.predictors if group in p.groups)
 
     def predictor(self, name: str) -> Predictor:
         for predictor in self.predictors:
@@ -170,7 +191,7 @@ class ModelSpec:
 
     def without_group(self, group: str, *, name: str | None = None) -> ModelSpec:
         """Return a model without predictors tagged with ``group``."""
-        matched = tuple(p.name for p in self.predictors if group in p.groups)
+        matched = self.group_members(group)
         if not matched:
             raise KeyError(f"no predictors belong to group {group!r}")
         return self.without(*matched, name=name)
@@ -179,11 +200,15 @@ class ModelSpec:
         """Return a model with one predictor replaced using dataclass fields."""
         current = self.predictor(predictor)
         replacement = dataclass_replace(current, **changes)
-        terms = tuple(replacement if p.name == predictor else p for p in self.predictors)
+        terms = tuple(
+            replacement if p.name == predictor else p for p in self.predictors
+        )
         return ModelSpec(terms, self.gains, name=self.name)
 
     def add(self, *predictors: Predictor, name: str | None = None) -> ModelSpec:
-        return ModelSpec(self.predictors + tuple(predictors), self.gains, name or self.name)
+        return ModelSpec(
+            self.predictors + tuple(predictors), self.gains, name or self.name
+        )
 
 
 @dataclass(frozen=True)
@@ -228,6 +253,16 @@ class FitState:
     gain: np.ndarray
     intercept: float
     iterations: tuple[Iteration, ...]
+    converged: bool
+
+    def __post_init__(self) -> None:
+        beta = np.array(self.beta, dtype=float, copy=True).ravel()
+        gain = np.array(self.gain, dtype=float, copy=True).ravel()
+        beta.setflags(write=False)
+        gain.setflags(write=False)
+        object.__setattr__(self, "beta", beta)
+        object.__setattr__(self, "gain", gain)
+        object.__setattr__(self, "iterations", tuple(self.iterations))
 
 
 @dataclass(frozen=True)
@@ -239,6 +274,13 @@ class FittedModel:
     config: FitConfig
     fit_mask: np.ndarray
 
+    def __post_init__(self) -> None:
+        mask = np.array(self.fit_mask, dtype=bool, copy=True).ravel()
+        if mask.size != self.prepared.data.n_time:
+            raise ValueError("fit mask has the wrong length")
+        mask.setflags(write=False)
+        object.__setattr__(self, "fit_mask", mask)
+
     @property
     def spec(self) -> ModelSpec:
         return self.prepared.spec
@@ -249,7 +291,7 @@ class FittedModel:
 
     @property
     def converged(self) -> bool:
-        return self.n_iter < self.config.max_iter
+        return self.state.converged
 
     @property
     def intercept(self) -> float:
@@ -266,6 +308,12 @@ class FittedModel:
 
         values = np.asarray(y, dtype=float).ravel()
         used = self.fit_mask if mask is None else np.asarray(mask, dtype=bool).ravel()
+        if values.size != self.prepared.data.n_time:
+            raise ValueError(
+                f"target has length {values.size}, expected {self.prepared.data.n_time}"
+            )
+        if used.size != values.size:
+            raise ValueError(f"mask has length {used.size}, expected {values.size}")
         prediction = self.predict(history=values if self.prepared.has_history else None)
         return r2_score(values[used], prediction[used])
 

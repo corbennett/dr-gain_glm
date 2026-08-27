@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Mapping, NamedTuple
+from typing import NamedTuple
 
 import numpy as np
+
+
+def _readonly(values: np.ndarray, *, dtype=float) -> np.ndarray:
+    output = np.array(values, dtype=dtype, copy=True).ravel()
+    output.setflags(write=False)
+    return output
 
 
 @dataclass(frozen=True)
@@ -16,8 +23,8 @@ class TimedSignal:
     times: np.ndarray | None = None
 
     def __post_init__(self) -> None:
-        values = np.asarray(self.values, dtype=float).ravel()
-        times = None if self.times is None else np.asarray(self.times, dtype=float).ravel()
+        values = _readonly(self.values)
+        times = None if self.times is None else _readonly(self.times)
         if times is not None and times.size != values.size:
             raise ValueError(
                 f"signal values and times must have equal length, got "
@@ -43,25 +50,21 @@ class ModelData:
     trial_values: Mapping[str, np.ndarray] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if self.dt <= 0:
+        if not np.isfinite(self.dt) or self.dt <= 0:
             raise ValueError(f"dt must be positive, got {self.dt}")
-        trial_index = np.asarray(self.trial_index, dtype=int).ravel()
+        trial_index = _readonly(self.trial_index, dtype=int)
         if trial_index.size == 0:
             raise ValueError("trial_index cannot be empty")
         if np.any(trial_index < 0):
             raise ValueError("trial_index must contain only non-negative indices")
 
-        events = {
-            name: np.asarray(times, dtype=float).ravel()
-            for name, times in self.events.items()
-        }
+        events = {name: _readonly(times) for name, times in self.events.items()}
         signals = {
             name: value if isinstance(value, TimedSignal) else TimedSignal(value)
             for name, value in self.signals.items()
         }
         trial_values = {
-            name: np.asarray(values, dtype=float).ravel()
-            for name, values in self.trial_values.items()
+            name: _readonly(values) for name, values in self.trial_values.items()
         }
         object.__setattr__(self, "trial_index", trial_index)
         object.__setattr__(self, "events", events)

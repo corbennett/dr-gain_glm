@@ -27,7 +27,9 @@ def main() -> None:
     running = rng.normal(size=n_time)
     cue_series = np.zeros(n_time)
     cue_series[np.floor(cue_times / 0.02).astype(int)] = 1
-    cue_drive = np.convolve(cue_series, np.exp(-np.arange(20) / 5), mode="full")[:n_time]
+    cue_drive = np.convolve(cue_series, np.exp(-np.arange(20) / 5), mode="full")[
+        :n_time
+    ]
     y = (
         0.2
         + (1.5 + 0.8 * context[trial_index]) * cue_drive

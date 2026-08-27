@@ -15,7 +15,9 @@ def plot_kernels(fitted: FittedModel, predictors: Sequence[str] | None = None):
     import matplotlib.pyplot as plt
 
     names = list(predictors or fitted.spec.predictor_names)
-    figure, axes = plt.subplots(len(names), 1, squeeze=False, figsize=(7, 2.2 * len(names)))
+    figure, axes = plt.subplots(
+        len(names), 1, squeeze=False, figsize=(7, 2.2 * len(names))
+    )
     for axis, name in zip(axes[:, 0], names):
         axis.plot(fitted.lags_seconds(name), fitted.kernel(name))
         axis.axvline(0, color="0.7", linewidth=1)
@@ -36,8 +38,14 @@ def plot_prediction(
 
     values = np.asarray(y, dtype=float).ravel()
     x = np.arange(values.size) * result.fit.prepared.data.dt if time is None else time
-    used = np.ones(values.size, dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
-    prediction = result.fit.predict(history=values if result.fit.prepared.has_history else None)
+    used = (
+        np.ones(values.size, dtype=bool)
+        if mask is None
+        else np.asarray(mask, dtype=bool)
+    )
+    prediction = result.fit.predict(
+        history=values if result.fit.prepared.has_history else None
+    )
     figure, axis = plt.subplots(figsize=(11, 3))
     axis.plot(x[used], values[used], label="observed", linewidth=1)
     axis.plot(x[used], prediction[used], label="fitted", linewidth=1)

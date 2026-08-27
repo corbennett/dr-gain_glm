@@ -2,8 +2,8 @@
 
 from .data import (
     ModelData,
-    TimedSignal,
     TimeBins,
+    TimedSignal,
     bin_spike_times,
     make_time_bins,
     make_trial_index,

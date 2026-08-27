@@ -82,7 +82,7 @@ def main() -> None:
     table = sessions().head(args.limit) if args.limit else sessions()
     for row in table.iter_rows(named=True):
         command = (
-            f"{PYTHON} -m gain_glm.dynamic_routing "
+            f"{PYTHON} -m gain_glm.batch "
             f"--nwb-path {row['nwb_path']} --session-id {row['session_id']} "
             f"--output-dir {OUTPUT_DIR} --model {args.model}"
         )

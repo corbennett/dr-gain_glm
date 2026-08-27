@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Literal, Mapping, Sequence
+from typing import Literal
 
 import numpy as np
 
@@ -81,6 +82,25 @@ class Dropout:
     ) -> Dropout:
         return cls(name or group, groups=(group,), refit=refit)
 
+    @classmethod
+    def terms(
+        cls,
+        name: str,
+        *,
+        predictors: Sequence[str] = (),
+        gains: Sequence[str] = (),
+        groups: Sequence[str] = (),
+        refit: Literal["auto", "gains", "full"] = "auto",
+    ) -> Dropout:
+        """Declare a mixed reduction using any combination of term selectors."""
+        return cls(
+            name,
+            remove_predictors=tuple(predictors),
+            remove_gains=tuple(gains),
+            groups=tuple(groups),
+            refit=refit,
+        )
+
     def resolve(self, prepared: PreparedDesign) -> ResolvedDropout:
         known_predictors = set(prepared.spec.predictor_names)
         known_gains = set(prepared.spec.gain_names)
@@ -98,7 +118,7 @@ class Dropout:
 
         predictors = set(self.remove_predictors)
         for group in self.groups:
-            matches = {p.name for p in prepared.spec.predictors if group in p.groups}
+            matches = set(prepared.spec.group_members(group))
             if not matches:
                 raise ValueError(
                     f"dropout {self.name!r}: no predictors belong to group {group!r}"
@@ -204,13 +224,9 @@ def _safe_history_rows(rows: np.ndarray, lag_bins: int) -> np.ndarray:
     return safe
 
 
-def _evaluation_mask(
-    prepared: PreparedDesign, mask: np.ndarray | None
-) -> np.ndarray:
+def _evaluation_mask(prepared: PreparedDesign, mask: np.ndarray | None) -> np.ndarray:
     selected = (
-        prepared.fit_mask
-        if mask is None
-        else np.asarray(mask, dtype=bool).ravel()
+        prepared.fit_mask if mask is None else np.asarray(mask, dtype=bool).ravel()
     )
     if selected.size != prepared.data.n_time:
         raise ValueError(
@@ -236,6 +252,8 @@ def evaluate(
         raise ValueError(
             f"target has length {values.size}, expected {prepared.data.n_time}"
         )
+    if not np.all(np.isfinite(values)):
+        raise ValueError("target contains non-finite values")
     fit_config = FitConfig() if fit is None else fit
     cv_config = CVConfig() if cv is None else cv
     selected = _evaluation_mask(prepared, mask)

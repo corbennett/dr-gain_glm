@@ -233,7 +233,8 @@ src/gain_glm/
     design.py            validation and design compilation
     _solver.py           private ALS implementation
     evaluation.py        CV and reduced-model comparisons
-    dynamic_routing.py   NWB adapter, default models, batch fitting
+    dynamic_routing.py   NWB adapter and default model declarations
+    batch.py             multi-unit fitting, comparison, and CLI
     plotting.py          optional plotting helpers
 
 scripts/                 comparison and cluster entry points

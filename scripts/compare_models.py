@@ -5,7 +5,8 @@ import argparse
 import polars.selectors as cs
 
 from gain_glm import CVConfig, Dropout, FitConfig
-from gain_glm.dynamic_routing import MODELS, compare_models, parse_dropout
+from gain_glm.batch import compare_models, parse_dropout
+from gain_glm.dynamic_routing import MODELS
 
 
 def main() -> None:
@@ -33,9 +34,7 @@ def main() -> None:
     )
     print(table)
     print(
-        table.group_by("model")
-        .agg(cs.numeric().mean())
-        .sort("cv_r2", descending=True)
+        table.group_by("model").agg(cs.numeric().mean()).sort("cv_r2", descending=True)
     )
 
 
