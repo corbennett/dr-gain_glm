@@ -18,9 +18,9 @@ from gain_glm.dynamic_routing import DEFAULT_DROPOUTS, MODELS
 
 REPO_DIR = Path(__file__).resolve().parents[1]
 PYTHON = str(REPO_DIR / ".venv/bin/python")
-OUTPUT_DIR = "/path/to/results"
+OUTPUT_DIR = "/allen//programs/mindscope/workgroups/dynamicrouting/corbettb/gain_glm"
 LOG_DIR = REPO_DIR / "logs"
-PARTITION = None
+PARTITION = 'braintv'
 CPUS = 8
 MEMORY = "32G"
 WALLTIME = "4:00:00"
