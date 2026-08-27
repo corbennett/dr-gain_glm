@@ -111,6 +111,18 @@ class EvaluationTests(unittest.TestCase):
         self.assertAlmostEqual(gains["context"], 0.8, delta=0.08)
         self.assertAlmostEqual(gains["value"], 0.3, delta=0.08)
 
+    def test_automatic_gain_alpha_is_reused_for_final_refit(self):
+        import gain_glm._solver as solver
+
+        config = FitConfig(max_iter=2)
+        with mock.patch.object(solver, "RidgeCV", wraps=solver.RidgeCV) as ridge_cv:
+            fitted = self.prepared.fit(self.y, config=config)
+
+        self.assertEqual(ridge_cv.call_count, 2)  # kernel and initial gain selection
+        selected = fitted.state.iterations[0].gain_alpha
+        self.assertIsNotNone(selected)
+        self.assertEqual(fitted.state.iterations[-1].gain_alpha, selected)
+
     def test_multiple_dropouts_share_full_fold_fits(self):
         from gain_glm import evaluation
 

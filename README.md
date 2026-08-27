@@ -132,6 +132,131 @@ Every requested dropout uses the same full-model CV folds and full-model fit
 within each fold. This avoids recomputing CV, a fit summary, and each ΔR²
 separately.
 
+### Current fitting procedure
+
+The implementation separates preparation, parameter fitting, and held-out
+evaluation. The details below describe the current behavior, including the
+defaults.
+
+#### Design rows and fitted rows
+
+`compile_design` constructs each predictor block across all `data.n_time` time
+bins. An event or continuous signal is shifted over its declared lag window and
+projected onto its basis, producing one block $B_p$ with shape
+`(n_time, n_basis)`. Trial values are also broadcast across all bins according
+to `data.trial_index`. A target is not centered, standardized, or smoothed by
+the core fitter; `y` is used as supplied.
+
+The prepared `fit_mask` does not shorten these cached arrays. It selects rows
+only when fitting and scoring. Consequently:
+
+- preparation and prediction span the complete time grid;
+- the full-data fit uses only selected rows;
+- outer-CV training and test sets use only selected rows within their trials;
+- `FittedModel.predict()` returns a prediction for every time bin; a target
+  history array is also required when the model contains `History`.
+
+Passing `mask=` directly to `fit()` or `evaluate()` replaces the prepared
+`fit_mask`; the two masks are not automatically intersected.
+
+For predictor $p$, let
+
+\[
+d_p(t) = B_p(t)\beta_p
+\]
+
+be its kernel drive. The fitted prediction is
+
+\[
+\hat y(t) = b_0
++ \sum_{p\ \mathrm{without\ gains}} d_p(t)
++ \sum_{p\ \mathrm{with\ gains}}
+\left[g_{0,p} + \sum_v g_{v,p}V_v(t)\right]d_p(t),
+\]
+
+where $V_v(t)$ is the value for the trial containing time bin $t$. Thus, if
+a globally convolved event response crosses a trial boundary, its gain at each
+row is the gain of the trial assigned to that row.
+
+#### Alternating kernel and gain updates
+
+The bilinear parameters are estimated by alternating linear regressions:
+
+1. Gain offsets are initialized to one and trial-variable gain coefficients to
+   zero. This makes every gain-modulated predictor initially enter with unit
+   gain.
+2. Holding gains fixed, the fitter constructs a kernel design whose columns
+   are the predictor basis blocks multiplied by their current time-varying
+   gains. It fits all kernel coefficients and an unpenalized intercept.
+3. Each gain-modulated reconstructed kernel is divided by its Euclidean norm.
+   Its gain offset and all of its trial-variable gain coefficients are
+   multiplied by the same norm, preserving the prediction while fixing the
+   otherwise arbitrary kernel/gain scale.
+4. Holding the normalized kernels and intercept fixed, the fitter computes
+   every predictor drive. The intercept and predictors without gains are
+   treated as fixed offsets. Gain offsets and trial-variable gain coefficients
+   are then fitted together with Ridge regression and no additional intercept.
+5. Steps 2–4 repeat until convergence or `max_iter` is reached. Convergence is
+   declared after every retained trial-variable gain coefficient changes by no
+   more than `tol` for `patience` consecutive iterations. Gain offsets are not
+   currently included in this convergence check. A model with no retained
+   trial-variable gain coefficients finishes after one alternating update.
+6. Finally, gains are refitted once against the final normalized kernels and
+   intercept. This final refit reuses the gain alpha selected during the first
+   gain update.
+
+`FitConfig.regularizer` controls only the kernel regression:
+
+- `"ridge"` uses an L2 penalty and is the default;
+- `"lasso"` uses an L1 penalty and warm-starts later ALS iterations.
+
+The gain regression always uses Ridge. Kernel basis coefficients are penalized
+by the selected kernel regularizer; gain offsets and trial-variable gain
+coefficients are Ridge-penalized. The overall model intercept is not.
+
+#### Automatic alpha selection
+
+`kernel_alpha` and `gain_alpha` are regularization strengths, not optimization
+learning rates. Supplying either value skips automatic selection for that
+parameter. When a value is `None`, the fitter searches `FitConfig.alphas`
+(25 values from $10^{-3}$ through $10^3$ by default) during the first
+corresponding ALS update and then holds the selected value fixed.
+
+`FitConfig.inner_cv_folds` is passed to the scikit-learn alpha selector. It is
+separate from the trial-held-out outer CV configured by `CVConfig`:
+
+- With Ridge and `inner_cv_folds=None`, `RidgeCV` uses its efficient
+  leave-one-observation-out procedure. With scikit-learn's default scoring,
+  alpha is selected by negative mean squared error.
+- With Ridge and an integer such as `inner_cv_folds=5`, `RidgeCV` uses ordinary
+  row-based K-fold splits. Because the code does not set `scoring`,
+  scikit-learn uses R² in this case.
+- With Lasso and `inner_cv_folds=None`, `LassoCV` uses its default five
+  row-based folds and selects alpha by validation mean squared error. An
+  integer changes the number of row-based folds.
+
+Inner alpha selection is therefore not currently trial-aware: bins from one
+trial may contribute to both its training and validation rows. The outer model
+evaluation described next does keep complete trials together.
+
+#### Full fit and trial-held-out evaluation
+
+`evaluate()` first fits one model to all selected rows and reports its training
+R². It then obtains the unique trial IDs, optionally permutes them using
+`CVConfig.seed`, and divides the trial IDs into `CVConfig.folds` groups. Every
+time bin from a trial belongs to the same outer training or test set. These
+outer folds are trial-aware but are not stratified by trial condition.
+
+Each outer training fold runs a new ALS fit and therefore selects its own
+regularization strengths when they were not explicitly supplied. R² is
+computed on the selected test rows of that fold. `CVResult.r2` is the
+unweighted mean of the per-fold R² values.
+
+With a `History` predictor, the history design is generated from the complete
+target before rows are selected. `CVConfig(gap_history=True)` removes boundary
+rows whose requested history reaches across the outer train/test assignment;
+the default is `False`.
+
 ### Reduced-model semantics
 
 The automatic refitting rule is based on what is removed:
@@ -139,9 +264,11 @@ The automatic refitting rule is based on what is removed:
 - Gain-only dropout: retain the full model's fold-specific kernels and
   intercept, then independently refit the reduced gain coefficients. This asks
   for the incremental gain contribution conditional on the learned response
-  shapes.
+  shapes. If `gain_alpha=None`, each reduced gain model selects its own Ridge
+  alpha from that fold's training rows.
 - Predictor or group dropout: fully refit the reduced bilinear model. Remaining
-  kernels, gains, and the intercept may adapt.
+  kernels, gains, and the intercept may adapt, and automatically selected
+  regularization strengths are chosen independently for that reduced fit.
 - Mixed gain and predictor dropout: fully refit the reduced model.
 
 Use `Dropout.gain("context", refit="full")` to ask the alternative scientific
@@ -149,6 +276,13 @@ question in which all remaining parameters adapt after removing a gain.
 
 Each `DropoutResult` records the resolved predictor names, gain names, refit
 strategy, reduced R², and ΔR² for every fold.
+
+For every outer fold, reduced models are evaluated on the same test rows as the
+full model. The reported per-fold quantity is
+
+\[
+\Delta R^2 = R^2_{\mathrm{full}} - R^2_{\mathrm{reduced}}.
+\]
 
 ## Model variants
 

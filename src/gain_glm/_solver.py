@@ -172,6 +172,7 @@ def refit_gains(
     config: FitConfig,
     *,
     keep: np.ndarray | None = None,
+    alpha: float | None = None,
 ) -> tuple[np.ndarray, float | None]:
     """Fit gain parameters while holding kernels and intercept fixed."""
     drives = _kernel_drives(prepared, blocks, beta)
@@ -185,7 +186,7 @@ def refit_gains(
         _gain_design(prepared, drives, gain_by_time),
         y - offset,
         keep=keep,
-        alpha=config.gain_alpha,
+        alpha=config.gain_alpha if alpha is None else alpha,
     )
 
 
@@ -358,6 +359,7 @@ def fit_state(
         intercept,
         config,
         keep=retained,
+        alpha=gain_alpha,
     )
     if iterations:
         prediction = predict_parameters(

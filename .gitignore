@@ -18,3 +18,5 @@ logs/
 scratch.ipynb
 *.png
 *.json
+*.ipynb
+
