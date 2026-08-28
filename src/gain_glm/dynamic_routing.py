@@ -58,6 +58,23 @@ def _stimulus_predictors(
     )
 
 
+LATE_STIMULUS_PREDICTOR_NAMES = tuple(f"{source}_late" for source in STIMULUS_EVENTS)
+
+
+def _late_stimulus_predictors() -> tuple[Event, ...]:
+    return tuple(
+        Event(
+            name,
+            source=source,
+            window=(0.1, 1),
+            n_basis=9,
+            gains=("context",),
+            groups=("stimulus", "late_stimulus", "task"),
+        )
+        for name, source in zip(LATE_STIMULUS_PREDICTOR_NAMES, STIMULUS_EVENTS)
+    )
+
+
 BEHAVIOR_PREDICTORS = (
     Event(
         "licks",
@@ -133,6 +150,7 @@ BEHAVIOR_PREDICTORS = (
 DEFAULT_MODEL = ModelSpec(
     predictors=(
         *_stimulus_predictors(),
+        *_late_stimulus_predictors(),
         Event(
             "is_hit",
             window=(0.1, 1),
@@ -178,8 +196,32 @@ MODELS: Mapping[str, ModelSpec] = {
         ALL_RESPONSE_MODEL,
     )
 }
-DEFAULT_DROPOUTS = (Dropout.gain("context"),
-                    Dropout.predictors('context_baseline'))
+DEFAULT_DROPOUTS = (
+    Dropout.gain("context"),
+    Dropout.gain_terms(
+        "context",
+        *STIMULUS_EVENTS,
+        name="early_stim_context_gain",
+    ),
+    Dropout.gain_terms(
+        "context",
+        *LATE_STIMULUS_PREDICTOR_NAMES,
+        name="late_stim_context_gain",
+    ),
+    Dropout.predictors("context_baseline"),
+)
+
+
+def default_dropouts(model: ModelSpec = DEFAULT_MODEL) -> tuple[Dropout, ...]:
+    """Return default comparisons compatible with a full-model declaration."""
+    has_split_stimulus = set(LATE_STIMULUS_PREDICTOR_NAMES).issubset(
+        model.predictor_names
+    )
+    if has_split_stimulus:
+        return DEFAULT_DROPOUTS
+    return tuple(
+        dropout for dropout in DEFAULT_DROPOUTS if not dropout.remove_gain_terms
+    )
 
 
 @dataclass(frozen=True)

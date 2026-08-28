@@ -115,6 +115,7 @@ result = prepared.evaluate(
     cv=CVConfig(folds=5, seed=0),
     dropouts=(
         Dropout.gain("context"),
+        Dropout.gain_terms("context", "cue", name="cue_context_gain"),
         Dropout.group("behavior"),
         Dropout.predictors("running", name="running_only"),
     ),
@@ -266,6 +267,10 @@ The automatic refitting rule is based on what is removed:
   for the incremental gain contribution conditional on the learned response
   shapes. If `gain_alpha=None`, each reduced gain model selects its own Ridge
   alpha from that fold's training rows.
+- Predictor-specific gain dropout: `Dropout.gain_terms()` removes one gain's
+  coefficients only from the selected predictors, then performs the same
+  fixed-kernel gain refit. Gain offsets and every unselected gain coefficient
+  remain in the reduced model.
 - Predictor or group dropout: fully refit the reduced bilinear model. Remaining
   kernels, gains, and the intercept may adapt, and automatically selected
   regularization strengths are chosen independently for that reduced fit.
@@ -327,6 +332,12 @@ Available full-model declarations are exposed through `MODELS`:
 - `no_face`
 - `no_hit_long_stim`
 - `all_response`
+
+The Dynamic Routing `default` model represents each stimulus with separate
+early (0–0.1 s) and late (0.1–1 s) kernels, both modulated by context. Its
+default dropouts compare the context gain on all early stimulus kernels and on
+all late stimulus kernels separately, in addition to the whole-context-gain and
+context-baseline comparisons.
 
 Fit a complete session from the command line:
 

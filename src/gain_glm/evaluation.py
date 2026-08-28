@@ -35,17 +35,29 @@ class CVConfig:
 
 @dataclass(frozen=True)
 class Dropout:
-    """A named request to remove gains, predictors, or predictor groups."""
+    """A named request to remove gains, gain terms, or predictors."""
 
     name: str
     remove_predictors: tuple[str, ...] = ()
     remove_gains: tuple[str, ...] = ()
     groups: tuple[str, ...] = ()
     refit: Literal["auto", "gains", "full"] = "auto"
+    remove_gain_terms: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "remove_predictors", tuple(self.remove_predictors))
         object.__setattr__(self, "remove_gains", tuple(self.remove_gains))
+        gain_terms: list[tuple[str, str]] = []
+        for term in self.remove_gain_terms:
+            if isinstance(term, str):
+                raise TypeError("gain terms must be (gain, predictor) pairs")
+            pair = tuple(term)
+            if not all(isinstance(name, str) for name in pair):
+                raise TypeError("gain and predictor names must be strings")
+            if len(pair) != 2:
+                raise ValueError("gain terms must be (gain, predictor) pairs")
+            gain_terms.append(pair)
+        object.__setattr__(self, "remove_gain_terms", tuple(gain_terms))
         object.__setattr__(self, "groups", tuple(self.groups))
         if not self.name:
             raise ValueError("dropout names cannot be empty")
@@ -61,6 +73,24 @@ class Dropout:
         refit: Literal["auto", "gains", "full"] = "auto",
     ) -> Dropout:
         return cls(name or gain, remove_gains=(gain,), refit=refit)
+
+    @classmethod
+    def gain_terms(
+        cls,
+        gain: str,
+        *predictors: str,
+        name: str | None = None,
+        refit: Literal["auto", "gains", "full"] = "auto",
+    ) -> Dropout:
+        """Remove one gain's coefficient from selected predictors only."""
+        if not predictors:
+            raise ValueError("gain_terms requires at least one predictor")
+        label = name or f"{gain}:" + "+".join(predictors)
+        return cls(
+            label,
+            remove_gain_terms=tuple((gain, predictor) for predictor in predictors),
+            refit=refit,
+        )
 
     @classmethod
     def predictors(
@@ -89,6 +119,7 @@ class Dropout:
         *,
         predictors: Sequence[str] = (),
         gains: Sequence[str] = (),
+        gain_terms: Sequence[tuple[str, str]] = (),
         groups: Sequence[str] = (),
         refit: Literal["auto", "gains", "full"] = "auto",
     ) -> Dropout:
@@ -97,6 +128,7 @@ class Dropout:
             name,
             remove_predictors=tuple(predictors),
             remove_gains=tuple(gains),
+            remove_gain_terms=tuple(gain_terms),
             groups=tuple(groups),
             refit=refit,
         )
@@ -104,8 +136,10 @@ class Dropout:
     def resolve(self, prepared: PreparedDesign) -> ResolvedDropout:
         known_predictors = set(prepared.spec.predictor_names)
         known_gains = set(prepared.spec.gain_names)
+        known_gain_terms = set(prepared.layout.gain_coefficients)
         unknown_predictors = set(self.remove_predictors) - known_predictors
         unknown_gains = set(self.remove_gains) - known_gains
+        unknown_gain_terms = set(self.remove_gain_terms) - known_gain_terms
         if unknown_predictors:
             raise ValueError(
                 f"dropout {self.name!r} has unknown predictors: "
@@ -114,6 +148,11 @@ class Dropout:
         if unknown_gains:
             raise ValueError(
                 f"dropout {self.name!r} has unknown gains: {sorted(unknown_gains)}"
+            )
+        if unknown_gain_terms:
+            raise ValueError(
+                f"dropout {self.name!r} has unknown gain terms: "
+                f"{sorted(unknown_gain_terms)}"
             )
 
         predictors = set(self.remove_predictors)
@@ -124,7 +163,7 @@ class Dropout:
                     f"dropout {self.name!r}: no predictors belong to group {group!r}"
                 )
             predictors.update(matches)
-        if not predictors and not self.remove_gains:
+        if not predictors and not self.remove_gains and not self.remove_gain_terms:
             raise ValueError(f"dropout {self.name!r} removes no model terms")
 
         strategy = self.refit
@@ -140,6 +179,11 @@ class Dropout:
                 p for p in prepared.spec.predictor_names if p in predictors
             ),
             gains=tuple(g for g in prepared.spec.gain_names if g in self.remove_gains),
+            gain_terms=tuple(
+                term
+                for term in prepared.layout.gain_coefficients
+                if term in self.remove_gain_terms
+            ),
             refit=strategy,
         )
 
@@ -150,6 +194,7 @@ class ResolvedDropout:
     predictors: tuple[str, ...]
     gains: tuple[str, ...]
     refit: Literal["gains", "full"]
+    gain_terms: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -201,6 +246,7 @@ class EvaluationResult:
                 name: {
                     "predictors": result.dropout.predictors,
                     "gains": result.dropout.gains,
+                    "gain_terms": result.dropout.gain_terms,
                     "refit": result.dropout.refit,
                     "reduced_r2": result.reduced_r2,
                     "reduced_r2_per_fold": result.reduced_r2_per_fold.copy(),
@@ -336,6 +382,7 @@ def evaluate(
             keep = gain_keep_mask(
                 prepared,
                 remove_gains=dropout.gains,
+                remove_gain_terms=dropout.gain_terms,
                 remove_predictors=dropout.predictors,
             )
             if dropout.refit == "gains":

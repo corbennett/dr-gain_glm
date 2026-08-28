@@ -103,19 +103,28 @@ def gain_keep_mask(
     prepared: PreparedDesign,
     *,
     remove_gains: Sequence[str] = (),
+    remove_gain_terms: Sequence[tuple[str, str]] = (),
     remove_predictors: Sequence[str] = (),
 ) -> np.ndarray:
     """Return gain-vector columns retained by a reduced model."""
     unknown_gains = set(remove_gains) - set(prepared.spec.gain_names)
+    unknown_gain_terms = set(remove_gain_terms) - set(prepared.layout.gain_coefficients)
     unknown_predictors = set(remove_predictors) - set(prepared.spec.predictor_names)
     if unknown_gains:
         raise ValueError(f"unknown gains: {sorted(unknown_gains)}")
+    if unknown_gain_terms:
+        raise ValueError(f"unknown gain terms: {sorted(unknown_gain_terms)}")
     if unknown_predictors:
         raise ValueError(f"unknown predictors: {sorted(unknown_predictors)}")
 
     keep = np.ones(prepared.layout.gain_size, dtype=bool)
+    removed_terms = set(remove_gain_terms)
     for (gain_name, predictor), index in prepared.layout.gain_coefficients.items():
-        if gain_name in remove_gains or predictor in remove_predictors:
+        if (
+            gain_name in remove_gains
+            or (gain_name, predictor) in removed_terms
+            or predictor in remove_predictors
+        ):
             keep[index] = False
     for predictor in remove_predictors:
         if predictor in prepared.layout.gain_offsets:

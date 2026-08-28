@@ -4,7 +4,7 @@ import argparse
 
 import polars.selectors as cs
 
-from gain_glm import CVConfig, Dropout, FitConfig
+from gain_glm import CVConfig, FitConfig
 from gain_glm.batch import compare_models, parse_dropout
 from gain_glm.dynamic_routing import MODELS
 
@@ -28,7 +28,7 @@ def main() -> None:
         [MODELS[name] for name in args.models],
         unit_ids=args.units,
         unit_limit=args.unit_limit,
-        dropouts=args.dropout or (Dropout.gain("context"),),
+        dropouts=args.dropout,
         fit=FitConfig(max_iter=args.max_iter),
         cv=CVConfig(folds=args.folds, seed=args.fold_seed),
     )

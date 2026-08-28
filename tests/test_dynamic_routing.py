@@ -4,8 +4,13 @@ import numpy as np
 import polars as pl
 
 from gain_glm.dynamic_routing import (
+    DEFAULT_DROPOUTS,
     DEFAULT_MODEL,
+    LATE_STIMULUS_PREDICTOR_NAMES,
+    NO_HIT_LONG_STIM_MODEL,
+    STIMULUS_EVENTS,
     SessionData,
+    default_dropouts,
     model_data,
     prepare,
 )
@@ -68,7 +73,31 @@ class DynamicRoutingAdapterTests(unittest.TestCase):
         prepared = prepare(self.make_session(), DEFAULT_MODEL)
         self.assertEqual(set(prepared.base_blocks), set(DEFAULT_MODEL.predictor_names))
         self.assertEqual(prepared.base_blocks["is_hit"].shape, (20, 9))
+        for source, name in zip(STIMULUS_EVENTS, LATE_STIMULUS_PREDICTOR_NAMES):
+            predictor = DEFAULT_MODEL.predictor(name)
+            self.assertEqual(predictor.source, source)
+            self.assertEqual(predictor.window, (0.1, 1))
+            self.assertEqual(predictor.n_basis, 9)
+            self.assertEqual(predictor.gains, ("context",))
+            self.assertEqual(prepared.base_blocks[name].shape, (20, 9))
         self.assertTrue(prepared.fit_mask.any())
+
+        resolved = {
+            dropout.name: dropout.resolve(prepared) for dropout in DEFAULT_DROPOUTS
+        }
+        self.assertEqual(
+            resolved["early_stim_context_gain"].gain_terms,
+            tuple(("context", name) for name in STIMULUS_EVENTS),
+        )
+        self.assertEqual(
+            resolved["late_stim_context_gain"].gain_terms,
+            tuple(("context", name) for name in LATE_STIMULUS_PREDICTOR_NAMES),
+        )
+
+        self.assertEqual(
+            tuple(dropout.name for dropout in default_dropouts(NO_HIT_LONG_STIM_MODEL)),
+            ("context", "context_baseline"),
+        )
 
 
 if __name__ == "__main__":

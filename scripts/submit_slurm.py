@@ -14,7 +14,7 @@ import polars as pl
 from dr_datacube import datacube_config, get_session_ids_from_github, list_nwb_sources
 from simple_slurm import Slurm
 
-from gain_glm.dynamic_routing import DEFAULT_DROPOUTS, MODELS
+from gain_glm.dynamic_routing import MODELS, default_dropouts
 
 REPO_DIR = Path(__file__).resolve().parents[1]
 PYTHON = str(REPO_DIR / ".venv/bin/python")
@@ -84,7 +84,9 @@ def save_run_params(
         "arguments": vars(args),
         "session_ids": session_ids,
         "model": asdict(MODELS[args.model]),
-        "dropouts": [asdict(dropout) for dropout in DEFAULT_DROPOUTS],
+        "dropouts": [
+            asdict(dropout) for dropout in default_dropouts(MODELS[args.model])
+        ],
     }
     with (output_dir / "run_params.json").open("w") as stream:
         json.dump(params, stream, indent=2)

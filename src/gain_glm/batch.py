@@ -15,12 +15,12 @@ from threadpoolctl import threadpool_limits
 
 from .design import PreparedDesign, compile_design
 from .dynamic_routing import (
-    DEFAULT_DROPOUTS,
     DEFAULT_DT,
     DEFAULT_MODEL,
     MODELS,
     QC_COLUMN,
     STIMULUS_FIT_WINDOW,
+    default_dropouts,
     load_session,
     load_unit_target,
     model_data,
@@ -59,7 +59,7 @@ def fit_session(
     output_dir: str | Path,
     *,
     model: ModelSpec = DEFAULT_MODEL,
-    dropouts: Sequence[Dropout] = DEFAULT_DROPOUTS,
+    dropouts: Sequence[Dropout] | None = None,
     fit: FitConfig | None = None,
     cv: CVConfig | None = None,
     dt: float = DEFAULT_DT,
@@ -84,9 +84,10 @@ def fit_session(
     targets = {unit: load_unit_target(session, unit) for unit in units}
     fit_config = FitConfig(max_iter=50) if fit is None else fit
     cv_config = CVConfig() if cv is None else cv
+    dropout_requests = default_dropouts(model) if dropouts is None else tuple(dropouts)
     results = Parallel(n_jobs=n_jobs, prefer="processes")(
         delayed(_evaluate_unit)(
-            unit, targets[unit], prepared, fit_config, cv_config, tuple(dropouts)
+            unit, targets[unit], prepared, fit_config, cv_config, dropout_requests
         )
         for unit in units
     )
@@ -106,7 +107,7 @@ def compare_models(
     models: Sequence[ModelSpec],
     *,
     unit_ids: Sequence[str] | None = None,
-    dropouts: Sequence[Dropout] = DEFAULT_DROPOUTS,
+    dropouts: Sequence[Dropout] | None = None,
     fit: FitConfig | None = None,
     cv: CVConfig | None = None,
     dt: float = DEFAULT_DT,
@@ -133,13 +134,16 @@ def compare_models(
 
     rows: list[dict[str, Any]] = []
     for model in models:
+        dropout_requests = (
+            default_dropouts(model) if dropouts is None else tuple(dropouts)
+        )
         for unit in units:
             with threadpool_limits(1):
                 result = prepared[model.name].evaluate(
                     targets[unit],
                     fit=fit_config,
                     cv=cv_config,
-                    dropouts=dropouts,
+                    dropouts=dropout_requests,
                 )
             row: dict[str, Any] = {
                 "model": model.name,
@@ -200,7 +204,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.session_id,
         args.output_dir,
         model=MODELS[args.model],
-        dropouts=args.dropout or DEFAULT_DROPOUTS,
+        dropouts=args.dropout,
         fit=FitConfig(max_iter=args.max_iter),
         cv=CVConfig(folds=args.folds, seed=args.fold_seed),
         dt=args.dt,

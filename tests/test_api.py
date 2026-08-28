@@ -82,18 +82,34 @@ class SpecificationTests(unittest.TestCase):
     def test_dropout_resolves_groups_and_refit_strategy(self):
         prepared, _ = synthetic_problem()
         gain = Dropout.gain("context").resolve(prepared)
+        gain_term = Dropout.gain_terms("context", "x").resolve(prepared)
         behavior = Dropout.group("behavior").resolve(prepared)
 
         self.assertEqual(gain.gains, ("context",))
         self.assertEqual(gain.refit, "gains")
+        self.assertEqual(gain_term.gains, ())
+        self.assertEqual(gain_term.gain_terms, (("context", "x"),))
+        self.assertEqual(gain_term.refit, "gains")
         self.assertEqual(behavior.predictors, ("nuisance",))
         self.assertEqual(behavior.refit, "full")
+
+        from gain_glm._solver import gain_keep_mask
+
+        keep = gain_keep_mask(prepared, remove_gain_terms=gain_term.gain_terms)
+        layout = prepared.layout
+        self.assertFalse(keep[layout.gain_coefficients[("context", "x")]])
+        self.assertTrue(keep[layout.gain_coefficients[("value", "x")]])
+        self.assertTrue(keep[layout.gain_offsets["x"]])
+
+        with self.assertRaisesRegex(ValueError, "unknown gain terms"):
+            Dropout.gain_terms("context", "nuisance").resolve(prepared)
 
         mixed = Dropout.terms(
             "task_context", groups=("task",), gains=("context",)
         ).resolve(prepared)
         self.assertEqual(mixed.predictors, ("x",))
         self.assertEqual(mixed.gains, ("context",))
+        self.assertEqual(mixed.gain_terms, ())
         self.assertEqual(mixed.refit, "full")
 
 
