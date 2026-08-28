@@ -40,6 +40,26 @@ def sessions() -> pl.DataFrame:
     return paths.select("session_id", "nwb_path")
 
 
+def pending_sessions(
+    session_ids: list[str], output_dir: Path, *, overwrite: bool = False
+) -> list[str]:
+    """Return sessions whose output file does not already exist."""
+    if overwrite:
+        return session_ids
+    return [
+        session_id
+        for session_id in session_ids
+        if not (output_dir / f"{session_id}.json").exists()
+    ]
+
+
+def resolve_output_dir(output_dir: str | None) -> Path:
+    """Use an explicit output directory or the date-based default."""
+    if output_dir is not None:
+        return Path(output_dir)
+    return Path(OUTPUT_DIR) / datetime.now().astimezone().strftime("%m%d%y")
+
+
 def slurm_job(session_id: str) -> Slurm:
     options = {
         "job_name": f"glm_{session_id}",
@@ -78,12 +98,22 @@ def main() -> None:
     parser.add_argument("--unit-limit", type=int)
     parser.add_argument("--model", choices=MODELS, default="default")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--output-dir",
+        help=f"Output directory (default: {OUTPUT_DIR}/<MMDDYY>)",
+    )
     args = parser.parse_args()
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    run_output_dir = Path(OUTPUT_DIR) / datetime.now().astimezone().strftime("%m%d%y")
+    run_output_dir = resolve_output_dir(args.output_dir)
     run_output_dir.mkdir(parents=True, exist_ok=True)
     table = sessions().head(args.limit) if args.limit else sessions()
+    session_ids = pending_sessions(
+        table["session_id"].to_list(), run_output_dir, overwrite=args.overwrite
+    )
+    if len(session_ids) != table.height:
+        print(f"skipping {table.height - len(session_ids)} sessions with existing output")
+        table = table.filter(pl.col("session_id").is_in(session_ids))
     for row in table.iter_rows(named=True):
         command = (
             'export LAZYNWB_CATALOG_CACHE_PATH='
