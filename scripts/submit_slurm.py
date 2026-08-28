@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 import polars as pl
-from dr_datacube import get_session_ids_from_github, list_nwb_sources, datacube_config
+from dr_datacube import datacube_config, get_session_ids_from_github, list_nwb_sources
 from simple_slurm import Slurm
 
 from gain_glm.dynamic_routing import DEFAULT_DROPOUTS, MODELS
@@ -86,6 +86,8 @@ def main() -> None:
     table = sessions().head(args.limit) if args.limit else sessions()
     for row in table.iter_rows(named=True):
         command = (
+            'export LAZYNWB_CATALOG_CACHE_PATH='
+            '"${SLURM_TMPDIR:-/tmp}/lazynwb/catalog-${SLURM_JOB_ID}.sqlite"; '
             f"{PYTHON} -m gain_glm.batch "
             f"--nwb-path {row['nwb_path']} --session-id {row['session_id']} "
             f"--output-dir {run_output_dir} --model {args.model}"
