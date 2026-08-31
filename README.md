@@ -3,15 +3,15 @@
 `gain-glm` fits bilinear encoding models whose temporal kernels can be scaled
 by trial-level variables such as context, value, attention, or arousal.
 
-For predictor \(p\) on trial \(n\),
+For predictor $p$ on trial $n$,
 
-\[
+$$
 y(t,n) = b_0 + \sum_p g_{p,n}(X_p * K_p)(t) + \epsilon(t,n)
-\]
+$$
 
-\[
+$$
 g_{p,n} = g_{0,p} + \sum_v g_{v,p}V_{v,n}.
-\]
+$$
 
 The package separates four things that used to be mixed together:
 
@@ -162,18 +162,18 @@ Passing `mask=` directly to `fit()` or `evaluate()` replaces the prepared
 
 For predictor $p$, let
 
-\[
+$$
 d_p(t) = B_p(t)\beta_p
-\]
+$$
 
 be its kernel drive. The fitted prediction is
 
-\[
+$$
 \hat y(t) = b_0
 + \sum_{p\ \mathrm{without\ gains}} d_p(t)
 + \sum_{p\ \mathrm{with\ gains}}
 \left[g_{0,p} + \sum_v g_{v,p}V_v(t)\right]d_p(t),
-\]
+$$
 
 where $V_v(t)$ is the value for the trial containing time bin $t$. Thus, if
 a globally convolved event response crosses a trial boundary, its gain at each
@@ -285,9 +285,9 @@ strategy, reduced R², and ΔR² for every fold.
 For every outer fold, reduced models are evaluated on the same test rows as the
 full model. The reported per-fold quantity is
 
-\[
+$$
 \Delta R^2 = R^2_{\mathrm{full}} - R^2_{\mathrm{reduced}}.
-\]
+$$
 
 ## Model variants
 
