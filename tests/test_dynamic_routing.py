@@ -8,9 +8,9 @@ from gain_glm.dynamic_routing import (
     DEFAULT_MODEL,
     LATE_STIMULUS_PREDICTOR_NAMES,
     NO_HIT_LONG_STIM_MODEL,
+    ONLY_BASELINE_MODEL,
     STIMULUS_EVENTS,
     SessionData,
-    default_dropouts,
     model_data,
     prepare,
 )
@@ -41,10 +41,10 @@ class DynamicRoutingAdapterTests(unittest.TestCase):
             pose_columns[feature + "_temporal_norm"] = np.zeros(sample_times.size)
         return SessionData(
             nwb_path="fake.nwb",
-            dt=0.1,
+            dt=DEFAULT_MODEL.dt,
             task_start_time=10.0,
             task_end_time=12.0,
-            n_time=20,
+            n_time=80,
             trials=pl.DataFrame(trial_rows),
             trial_start_times=np.array([10.0, 11.0]),
             trial_end_times=np.array([11.0, 12.0]),
@@ -61,26 +61,29 @@ class DynamicRoutingAdapterTests(unittest.TestCase):
         data = model_data(self.make_session())
         np.testing.assert_allclose(data.events["is_aud_target"], [0.2])
         np.testing.assert_allclose(data.events["is_vis_target"], [1.2])
-        np.testing.assert_array_equal(data.trial_index[:10], 0)
-        np.testing.assert_array_equal(data.trial_index[10:], 1)
+        np.testing.assert_array_equal(data.trial_index[:40], 0)
+        np.testing.assert_array_equal(data.trial_index[40:], 1)
         np.testing.assert_array_equal(data.trial_values["trial_context"], [-1, 1])
         context_baseline = data.signals["context_baseline"]
         self.assertIsNone(context_baseline.times)
-        np.testing.assert_array_equal(context_baseline.values[:10], -1)
-        np.testing.assert_array_equal(context_baseline.values[10:], 1)
+        np.testing.assert_array_equal(context_baseline.values[:40], -1)
+        np.testing.assert_array_equal(context_baseline.values[40:], 1)
 
     def test_default_model_prepares_without_builder_functions(self):
         prepared = prepare(self.make_session(), DEFAULT_MODEL)
         self.assertEqual(set(prepared.base_blocks), set(DEFAULT_MODEL.predictor_names))
-        self.assertEqual(prepared.base_blocks["is_hit"].shape, (20, 9))
+        self.assertEqual(prepared.base_blocks["is_hit"].shape, (80, 9))
         for source, name in zip(STIMULUS_EVENTS, LATE_STIMULUS_PREDICTOR_NAMES):
             predictor = DEFAULT_MODEL.predictor(name)
             self.assertEqual(predictor.source, source)
             self.assertEqual(predictor.window, (0.1, 1))
             self.assertEqual(predictor.n_basis, 9)
             self.assertEqual(predictor.gains, ("context",))
-            self.assertEqual(prepared.base_blocks[name].shape, (20, 9))
-        self.assertTrue(prepared.fit_mask.any())
+            self.assertEqual(prepared.base_blocks[name].shape, (80, 9))
+        self.assertEqual(DEFAULT_MODEL.fit_window, (-0.5, 1.0))
+        self.assertEqual(DEFAULT_MODEL.fit_events, STIMULUS_EVENTS)
+        self.assertEqual(DEFAULT_MODEL.dropouts, DEFAULT_DROPOUTS)
+        self.assertTrue(prepared.fit_mask.all())
 
         resolved = {
             dropout.name: dropout.resolve(prepared) for dropout in DEFAULT_DROPOUTS
@@ -95,8 +98,12 @@ class DynamicRoutingAdapterTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            tuple(dropout.name for dropout in default_dropouts(NO_HIT_LONG_STIM_MODEL)),
+            tuple(dropout.name for dropout in NO_HIT_LONG_STIM_MODEL.dropouts),
             ("context", "context_baseline"),
+        )
+        self.assertEqual(
+            tuple(dropout.name for dropout in ONLY_BASELINE_MODEL.dropouts),
+            ("context_baseline",),
         )
 
 

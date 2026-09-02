@@ -8,11 +8,12 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from .data import ModelData, TimedSignal
+from .data import ModelData, TimedSignal, windows_mask
 from .model import Event, FitConfig, FittedModel, History, ModelSpec, Signal
 
 if TYPE_CHECKING:
-    from .evaluation import CVConfig, Dropout, EvaluationResult
+    from .evaluation import CVConfig, EvaluationResult
+    from .model import Dropout
 
 
 def linear_cosine_basis(n_basis: int, n_lag_bins: int) -> np.ndarray:
@@ -291,8 +292,31 @@ def compile_design(
     fit_mask: np.ndarray | None = None,
 ) -> PreparedDesign:
     """Resolve all named inputs and precompute target-independent convolutions."""
+    if not np.isclose(spec.dt, data.dt):
+        raise ValueError(
+            f"model dt {spec.dt} does not match data dt {data.dt}"
+        )
     if fit_mask is None:
-        mask = np.ones(data.n_time, dtype=bool)
+        if spec.fit_window is None:
+            mask = np.ones(data.n_time, dtype=bool)
+        else:
+            missing = set(spec.fit_events) - set(data.events)
+            if missing:
+                raise KeyError(f"fit event sources are missing: {sorted(missing)}")
+            fit_times = []
+            for source in spec.fit_events:
+                times = data.events[source]
+                if not np.all(np.isfinite(times)):
+                    raise ValueError(f"fit event source {source!r} contains non-finite times")
+                fit_times.append(times)
+            mask = windows_mask(
+                np.concatenate(fit_times),
+                data.n_time,
+                data.dt,
+                spec.fit_window,
+            )
+            if not mask.any():
+                raise ValueError("model fit window selects no bins")
     else:
         mask = np.asarray(fit_mask, dtype=bool).ravel()
         if mask.size != data.n_time:

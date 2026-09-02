@@ -106,6 +106,11 @@ def main() -> None:
         ),
         gains=(Gain("context"),),
         name="cue_gain",
+        dt=dt,
+        dropouts=(
+            Dropout.gain("context"),
+            Dropout.group("behavior"),
+        ),
     )
 
     prepared = compile_design(model, data)
@@ -113,10 +118,6 @@ def main() -> None:
         y,
         fit=FitConfig(regularizer="ridge", kernel_alpha=1e-3, gain_alpha=1e-3),
         cv=CVConfig(folds=5, seed=0),
-        dropouts=[
-            Dropout.gain("context"),
-            Dropout.group("behavior"),
-        ],
     )
 
     fitted_gain = result.fit.gain_table()["cue"]

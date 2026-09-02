@@ -20,7 +20,7 @@ def main() -> None:
     parser.add_argument("--dropout", action="append", type=parse_dropout)
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--fold-seed", type=int)
-    parser.add_argument("--max-iter", type=int, default=50)
+    parser.add_argument("--max-iter", type=int, default=FitConfig().max_iter)
     args = parser.parse_args()
 
     table = compare_models(

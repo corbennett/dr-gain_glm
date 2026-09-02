@@ -266,6 +266,9 @@ def fit_state(
         index for index in prepared.layout.gain_coefficients.values() if retained[index]
     ]
     previous = gain[variable_indices].copy()
+    previous_mse = float(np.mean(y**2))
+    previous_prediction = np.zeros_like(y)
+    target_scale = max(float(np.std(y)), np.finfo(float).eps)
     stable = 0
     converged = False
     iterations: list[Iteration] = []
@@ -339,18 +342,48 @@ def fit_state(
             prepared, blocks, gain_by_time, beta, gain, intercept
         )
         mse = float(np.mean((y - prediction) ** 2))
-        iterations.append(Iteration(iteration, mse, float(kernel_alpha), gain_alpha))
+        relative_mse_change = abs(mse - previous_mse) / max(
+            abs(previous_mse), np.finfo(float).eps
+        )
+        relative_prediction_change = float(
+            np.sqrt(np.mean((prediction - previous_prediction) ** 2)) / target_scale
+        )
+        if variable_indices:
+            current = gain[variable_indices]
+            absolute_gain_change = np.abs(current - previous)
+            max_abs_gain_change = float(np.max(absolute_gain_change))
+            relative_gain_change = float(
+                np.max(absolute_gain_change / (1.0 + np.abs(previous)))
+            )
+        else:
+            current = np.zeros(0)
+            max_abs_gain_change = 0.0
+            relative_gain_change = 0.0
+        iterations.append(
+            Iteration(
+                iteration,
+                mse,
+                float(kernel_alpha),
+                gain_alpha,
+                relative_mse_change,
+                relative_prediction_change,
+                relative_gain_change,
+                max_abs_gain_change,
+            )
+        )
         if config.verbose:
             print(
                 f"iter {iteration:3d} mse={mse:.6g} "
-                f"kernel_alpha={kernel_alpha:.3g} gain_alpha={gain_alpha}"
+                f"kernel_alpha={kernel_alpha:.3g} gain_alpha={gain_alpha} "
+                f"relative_mse_change={relative_mse_change:.3g} "
+                f"relative_prediction_change={relative_prediction_change:.3g} "
+                f"max_abs_gain_change={max_abs_gain_change:.3g}"
             )
 
         if not variable_indices:
             converged = True
             break
-        current = gain[variable_indices]
-        if np.max(np.abs(current - previous)) <= config.tol:
+        if max_abs_gain_change <= config.tol:
             stable += 1
             if stable >= config.patience:
                 converged = True
@@ -358,6 +391,8 @@ def fit_state(
         else:
             stable = 0
         previous = current.copy()
+        previous_mse = mse
+        previous_prediction = prediction.copy()
 
     gain, final_gain_alpha = refit_gains(
         prepared,
@@ -380,6 +415,10 @@ def fit_state(
             float(np.mean((y - prediction) ** 2)),
             final.kernel_alpha,
             final_gain_alpha,
+            final.relative_mse_change,
+            final.relative_prediction_change,
+            final.relative_gain_change,
+            final.max_abs_gain_change,
         )
     return FitState(beta, gain, intercept, tuple(iterations), converged)
 

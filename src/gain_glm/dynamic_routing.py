@@ -21,8 +21,7 @@ from .data import (
     windows_mask,
 )
 from .design import PreparedDesign, compile_design
-from .evaluation import Dropout
-from .model import Event, Gain, ModelSpec, Signal
+from .model import Dropout, Event, Gain, ModelSpec, Signal
 
 lazynwb.config.anon = True
 
@@ -147,6 +146,21 @@ BEHAVIOR_PREDICTORS = (
     ),
 )
 
+DEFAULT_DROPOUTS = (
+    Dropout.gain("context"),
+    Dropout.gain_terms(
+        "context",
+        *STIMULUS_EVENTS,
+        name="early_stim_context_gain",
+    ),
+    Dropout.gain_terms(
+        "context",
+        *LATE_STIMULUS_PREDICTOR_NAMES,
+        name="late_stim_context_gain",
+    ),
+    Dropout.predictors("context_baseline"),
+)
+
 DEFAULT_MODEL = ModelSpec(
     predictors=(
         *_stimulus_predictors(),
@@ -162,6 +176,10 @@ DEFAULT_MODEL = ModelSpec(
     ),
     gains=(Gain("context", source="trial_context"),),
     name="default",
+    dt=DEFAULT_DT,
+    fit_window=STIMULUS_FIT_WINDOW,
+    fit_events=STIMULUS_EVENTS,
+    dropouts=DEFAULT_DROPOUTS,
 )
 
 NO_FACE_MODEL = DEFAULT_MODEL.without_group("face", name="no_face")
@@ -170,6 +188,13 @@ NO_HIT_LONG_STIM_MODEL = ModelSpec(
     predictors=(*_stimulus_predictors(window=(0, 1), n_basis=10), *BEHAVIOR_PREDICTORS),
     gains=DEFAULT_MODEL.gains,
     name="no_hit_long_stim",
+    dt=DEFAULT_DT,
+    fit_window=STIMULUS_FIT_WINDOW,
+    fit_events=STIMULUS_EVENTS,
+    dropouts=(
+        Dropout.gain("context"),
+        Dropout.predictors("context_baseline"),
+    ),
 )
 
 ALL_RESPONSE_MODEL = DEFAULT_MODEL.add(
@@ -187,6 +212,58 @@ ALL_RESPONSE_MODEL = DEFAULT_MODEL.add(
     name="all_response",
 )
 
+ONLY_BASELINE_MODEL = ModelSpec(
+    predictors=(
+        Signal(
+            "context_baseline",
+            window=(0, 0),
+            n_basis=1,
+            groups=("context",),
+        ),
+        Signal(
+            "ear",
+            window=(-0.5,0.5),
+            n_basis=10,
+            normalize="zscore",
+            groups=("behavior", "face"),
+        ),
+        Signal(
+            "jaw",
+            window=(-0.5,0.5),
+            n_basis=10,
+            normalize="zscore",
+            groups=("behavior", "face"),
+        ),
+        Signal(
+            "nose",
+            window=(-0.5,0.5),
+            n_basis=10,
+            normalize="zscore",
+            groups=("behavior", "face"),
+        ),
+        Signal(
+            "whisker_pad",
+            window=(-0.5,0.5),
+            n_basis=10,
+            normalize="zscore",
+            groups=("behavior", "face"),
+        ),
+        Signal(
+            "time",
+            window=(0, 0),
+            n_basis=1,
+            normalize="zscore",
+            groups=("nuisance",),
+        ),
+    ),
+    gains=(),
+    name="only_baseline",
+    dt=DEFAULT_DT,
+    fit_window=(-1.5, 0),
+    fit_events=STIMULUS_EVENTS,
+    dropouts=(Dropout.predictors("context_baseline"),),
+)
+
 MODELS: Mapping[str, ModelSpec] = {
     model.name: model
     for model in (
@@ -194,34 +271,9 @@ MODELS: Mapping[str, ModelSpec] = {
         NO_FACE_MODEL,
         NO_HIT_LONG_STIM_MODEL,
         ALL_RESPONSE_MODEL,
+        ONLY_BASELINE_MODEL,
     )
 }
-DEFAULT_DROPOUTS = (
-    Dropout.gain("context"),
-    Dropout.gain_terms(
-        "context",
-        *STIMULUS_EVENTS,
-        name="early_stim_context_gain",
-    ),
-    Dropout.gain_terms(
-        "context",
-        *LATE_STIMULUS_PREDICTOR_NAMES,
-        name="late_stim_context_gain",
-    ),
-    Dropout.predictors("context_baseline"),
-)
-
-
-def default_dropouts(model: ModelSpec = DEFAULT_MODEL) -> tuple[Dropout, ...]:
-    """Return default comparisons compatible with a full-model declaration."""
-    has_split_stimulus = set(LATE_STIMULUS_PREDICTOR_NAMES).issubset(
-        model.predictor_names
-    )
-    if has_split_stimulus:
-        return DEFAULT_DROPOUTS
-    return tuple(
-        dropout for dropout in DEFAULT_DROPOUTS if not dropout.remove_gain_terms
-    )
 
 
 @dataclass(frozen=True)
@@ -395,13 +447,10 @@ def stimulus_mask(
 def prepare(
     session: SessionData,
     model: ModelSpec = DEFAULT_MODEL,
-    *,
-    fit_window: tuple[float, float] | None = STIMULUS_FIT_WINDOW,
 ) -> PreparedDesign:
     """Build one session-shared design for a declared model."""
     data = model_data(session)
-    mask = None if fit_window is None else stimulus_mask(data, fit_window)
-    return compile_design(model, data, fit_mask=mask)
+    return compile_design(model, data)
 
 
 def qc_unit_ids(nwb_path: str, *, qc_column: str = QC_COLUMN) -> list[str]:

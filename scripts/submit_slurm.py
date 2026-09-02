@@ -14,7 +14,8 @@ import polars as pl
 from dr_datacube import datacube_config, get_session_ids_from_github, list_nwb_sources
 from simple_slurm import Slurm
 
-from gain_glm.dynamic_routing import MODELS, default_dropouts
+from gain_glm import FitConfig
+from gain_glm.dynamic_routing import MODELS
 
 REPO_DIR = Path(__file__).resolve().parents[1]
 PYTHON = str(REPO_DIR / ".venv/bin/python")
@@ -84,9 +85,7 @@ def save_run_params(
         "arguments": vars(args),
         "session_ids": session_ids,
         "model": asdict(MODELS[args.model]),
-        "dropouts": [
-            asdict(dropout) for dropout in default_dropouts(MODELS[args.model])
-        ],
+        "dropouts": [asdict(dropout) for dropout in MODELS[args.model].dropouts],
     }
     with (output_dir / "run_params.json").open("w") as stream:
         json.dump(params, stream, indent=2)
@@ -99,6 +98,7 @@ def main() -> None:
     parser.add_argument("--limit", type=int)
     parser.add_argument("--unit-limit", type=int)
     parser.add_argument("--model", choices=MODELS, default="default")
+    parser.add_argument("--max-iter", type=int, default=FitConfig().max_iter)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument(
         "--output-dir",
@@ -122,7 +122,8 @@ def main() -> None:
             '"${SLURM_TMPDIR:-/tmp}/lazynwb/catalog-${SLURM_JOB_ID}.sqlite"; '
             f"{PYTHON} -m gain_glm.batch "
             f"--nwb-path {row['nwb_path']} --session-id {row['session_id']} "
-            f"--output-dir {run_output_dir} --model {args.model}"
+            f"--output-dir {run_output_dir} --model {args.model} "
+            f"--max-iter {args.max_iter}"
         )
         if args.unit_limit:
             command += f" --limit {args.unit_limit}"

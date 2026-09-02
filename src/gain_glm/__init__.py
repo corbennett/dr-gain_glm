@@ -13,25 +13,27 @@ from .design import PreparedDesign, compile_design
 from .evaluation import (
     CVConfig,
     CVResult,
-    Dropout,
     DropoutResult,
     EvaluationResult,
-    ResolvedDropout,
     evaluate,
 )
 from .model import (
+    ConvergenceDiagnostics,
+    Dropout,
     Event,
     FitConfig,
     FittedModel,
     Gain,
     History,
     ModelSpec,
+    ResolvedDropout,
     Signal,
 )
 
 __all__ = [
     "CVConfig",
     "CVResult",
+    "ConvergenceDiagnostics",
     "Dropout",
     "DropoutResult",
     "EvaluationResult",

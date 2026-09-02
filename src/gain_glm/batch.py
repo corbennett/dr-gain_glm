@@ -15,21 +15,17 @@ from threadpoolctl import threadpool_limits
 
 from .design import PreparedDesign, compile_design
 from .dynamic_routing import (
-    DEFAULT_DT,
     DEFAULT_MODEL,
     MODELS,
     QC_COLUMN,
-    STIMULUS_FIT_WINDOW,
-    default_dropouts,
     load_session,
     load_unit_target,
     model_data,
     prepare,
     qc_unit_ids,
-    stimulus_mask,
 )
-from .evaluation import CVConfig, Dropout
-from .model import FitConfig, ModelSpec
+from .evaluation import CVConfig
+from .model import Dropout, FitConfig, ModelSpec
 
 
 def _json_default(value: Any):
@@ -62,8 +58,6 @@ def fit_session(
     dropouts: Sequence[Dropout] | None = None,
     fit: FitConfig | None = None,
     cv: CVConfig | None = None,
-    dt: float = DEFAULT_DT,
-    fit_window: tuple[float, float] | None = STIMULUS_FIT_WINDOW,
     n_jobs: int = -1,
     limit: int | None = None,
     qc_column: str = QC_COLUMN,
@@ -79,12 +73,12 @@ def fit_session(
     units = qc_unit_ids(nwb_path, qc_column=qc_column)
     if limit is not None:
         units = units[:limit]
-    session = load_session(nwb_path, dt=dt)
-    prepared = prepare(session, model, fit_window=fit_window)
+    session = load_session(nwb_path, dt=model.dt)
+    prepared = prepare(session, model)
     targets = {unit: load_unit_target(session, unit) for unit in units}
-    fit_config = FitConfig(max_iter=50) if fit is None else fit
+    fit_config = FitConfig() if fit is None else fit
     cv_config = CVConfig() if cv is None else cv
-    dropout_requests = default_dropouts(model) if dropouts is None else tuple(dropouts)
+    dropout_requests = model.dropouts if dropouts is None else tuple(dropouts)
     results = Parallel(n_jobs=n_jobs, prefer="processes")(
         delayed(_evaluate_unit)(
             unit, targets[unit], prepared, fit_config, cv_config, dropout_requests
@@ -94,7 +88,9 @@ def fit_session(
     payload = {
         "session_id": session_id,
         "model": model.name,
-        "dt": dt,
+        "dt": model.dt,
+        "fit_window": model.fit_window,
+        "fit_events": model.fit_events,
         "units": dict(results),
     }
     with output_path.open("w") as stream:
@@ -110,33 +106,35 @@ def compare_models(
     dropouts: Sequence[Dropout] | None = None,
     fit: FitConfig | None = None,
     cv: CVConfig | None = None,
-    dt: float = DEFAULT_DT,
-    fit_window: tuple[float, float] | None = STIMULUS_FIT_WINDOW,
     unit_limit: int = 8,
 ) -> pl.DataFrame:
     """Compare full-model variants using one session load and target cache."""
     if not models:
         raise ValueError("at least one model is required")
-    session = load_session(nwb_path, dt=dt)
+    reference = models[0]
+    if any(not np.isclose(model.dt, reference.dt) for model in models[1:]):
+        raise ValueError("compared models must use the same dt")
+    if any(
+        (model.fit_window, model.fit_events)
+        != (reference.fit_window, reference.fit_events)
+        for model in models[1:]
+    ):
+        raise ValueError("compared models must use the same fit window and events")
+    session = load_session(nwb_path, dt=reference.dt)
     inputs = model_data(session)
-    mask = None if fit_window is None else stimulus_mask(inputs, fit_window)
-    prepared = {
-        model.name: compile_design(model, inputs, fit_mask=mask) for model in models
-    }
+    prepared = {model.name: compile_design(model, inputs) for model in models}
     if len(prepared) != len(models):
         raise ValueError("model names must be unique")
     units = (
         list(unit_ids) if unit_ids is not None else qc_unit_ids(nwb_path)[:unit_limit]
     )
     targets = {unit: load_unit_target(session, unit) for unit in units}
-    fit_config = FitConfig(max_iter=50) if fit is None else fit
+    fit_config = FitConfig() if fit is None else fit
     cv_config = CVConfig() if cv is None else cv
 
     rows: list[dict[str, Any]] = []
     for model in models:
-        dropout_requests = (
-            default_dropouts(model) if dropouts is None else tuple(dropouts)
-        )
+        dropout_requests = model.dropouts if dropouts is None else tuple(dropouts)
         for unit in units:
             with threadpool_limits(1):
                 result = prepared[model.name].evaluate(
@@ -153,6 +151,8 @@ def compare_models(
                 "worst_fold_r2": float(np.min(result.cv.r2_per_fold)),
                 "n_iter": result.fit.n_iter,
                 "converged": result.fit.converged,
+                "cv_converged": result.cv.converged,
+                "n_converged_folds": int(np.sum(result.cv.converged_per_fold)),
             }
             for name, dropout in result.dropouts.items():
                 row[f"delta_r2_{name}"] = dropout.delta_r2
@@ -184,16 +184,21 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--session-id", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--model", choices=MODELS, default="default")
-    parser.add_argument(
+    dropout_options = parser.add_mutually_exclusive_group()
+    dropout_options.add_argument(
         "--dropout",
         action="append",
         type=parse_dropout,
         help="Repeatable: gain:name, group:name, or predictors:a,b",
     )
-    parser.add_argument("--dt", type=float, default=DEFAULT_DT)
+    dropout_options.add_argument(
+        "--no-dropouts",
+        action="store_true",
+        help="Disable the model's declared dropout comparisons",
+    )
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--fold-seed", type=int)
-    parser.add_argument("--max-iter", type=int, default=50)
+    parser.add_argument("--max-iter", type=int, default=FitConfig().max_iter)
     parser.add_argument("--n-jobs", type=int, default=-1)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--qc-column", default=QC_COLUMN)
@@ -204,10 +209,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.session_id,
         args.output_dir,
         model=MODELS[args.model],
-        dropouts=args.dropout,
+        dropouts=() if args.no_dropouts else args.dropout,
         fit=FitConfig(max_iter=args.max_iter),
         cv=CVConfig(folds=args.folds, seed=args.fold_seed),
-        dt=args.dt,
         n_jobs=args.n_jobs,
         limit=args.limit,
         qc_column=args.qc_column,

@@ -15,7 +15,8 @@ $$
 
 The package separates four things that used to be mixed together:
 
-1. `ModelSpec` declares predictors, gains, and useful predictor groups.
+1. `ModelSpec` declares the time grid, fitted rows, predictors, gains, groups,
+   and default reduced-model comparisons.
 2. `ModelData` supplies named arrays on one time grid.
 3. `PreparedDesign` caches session-shared convolutional design matrices.
 4. `EvaluationResult` contains one fit, trial-held-out CV, and any requested
@@ -44,7 +45,7 @@ Predictors refer to named data sources. A predictor lists its gains directly;
 there is no separate `gain_modulated` flag or target list to keep synchronized.
 
 ```python
-from gain_glm import Event, Gain, ModelSpec, Signal
+from gain_glm import Dropout, Event, Gain, ModelSpec, Signal
 
 model = ModelSpec(
     predictors=(
@@ -65,6 +66,15 @@ model = ModelSpec(
     ),
     gains=(Gain("context"),),
     name="cue_gain",
+    dt=0.01,
+    fit_window=(-0.5, 1.0),
+    fit_events=("cue",),
+    dropouts=(
+        Dropout.gain("context"),
+        Dropout.gain_terms("context", "cue", name="cue_context_gain"),
+        Dropout.group("behavior"),
+        Dropout.predictors("running", name="running_only"),
+    ),
 )
 ```
 
@@ -72,6 +82,11 @@ model = ModelSpec(
 reads `data.signals["running"]`; and `Gain("context")` reads
 `data.trial_values["context"]`. Use `source="another_name"` when the model
 term and input should have different names.
+
+`dt` fixes the model's sampling interval. When `fit_window` is present,
+`fit_events` names the event sources around which that window selects training
+and scoring rows. These are separate from each predictor's `window`, which
+defines the temporal support of its convolutional kernel.
 
 ## Supply data and prepare once
 
@@ -90,35 +105,31 @@ data = ModelData(
     },
 )
 
-prepared = compile_design(model, data, fit_mask=peri_stimulus_mask)
+prepared = compile_design(model, data)
 ```
 
 Irregular continuous signals are interpolated onto bin centers by default.
 Use `align="bin"` on a `Signal` to average samples within bins. Signals can be
 centered or z-scored as part of their declaration.
 
-`compile_design` validates all source names and dimensions before doing an
-expensive fit. Its output can be reused for every target recorded in the same
-session.
+`compile_design` validates that `data.dt` matches `model.dt`, resolves the
+model's event-anchored fit window, and validates all source names and dimensions
+before doing an expensive fit. Its output can be reused for every target
+recorded in the same session. Passing `fit_mask=` explicitly replaces the
+model's declared fit window for that prepared design.
 
-## Fit, cross-validate, and request dropouts
+## Fit, cross-validate, and evaluate dropouts
 
 ```python
-from gain_glm import CVConfig, Dropout, FitConfig
+from gain_glm import CVConfig, FitConfig
 
 result = prepared.evaluate(
     y,
     fit=FitConfig(
         regularizer="ridge",
-        max_iter=50,
+        max_iter=100,
     ),
     cv=CVConfig(folds=5, seed=0),
-    dropouts=(
-        Dropout.gain("context"),
-        Dropout.gain_terms("context", "cue", name="cue_context_gain"),
-        Dropout.group("behavior"),
-        Dropout.predictors("running", name="running_only"),
-    ),
 )
 
 print(result.train_r2)
@@ -129,9 +140,17 @@ print(result.fit.gain_table())
 kernel = result.fit.kernel("cue")
 ```
 
+When `dropouts` is omitted, `evaluate()` uses the comparisons declared by the
+model. Passing a nonempty `dropouts=` sequence overrides those defaults;
+passing `dropouts=()` explicitly disables reduced-model comparisons.
+
 Every requested dropout uses the same full-model CV folds and full-model fit
 within each fold. This avoids recomputing CV, a fit summary, and each ΔR²
-separately.
+separately. Gain-only dropouts reuse that fold's selected gain penalty so the
+comparison changes only the requested gain terms. Results include separate
+convergence diagnostics for the final all-data fit, every full-model CV fold,
+and every iterative reduced-model fold; the legacy top-level `converged` field
+continues to describe only the final all-data fit.
 
 ### Current fitting procedure
 
@@ -292,10 +311,20 @@ $$
 ## Model variants
 
 A model variant changes the full hypothesis; a dropout tests terms nested in a
-given full hypothesis. Immutable transforms make variants explicit:
+given full hypothesis. Immutable transforms preserve the model's declared
+dropouts. If a transform removes terms referenced by a dropout, pass the
+compatible comparison set explicitly:
 
 ```python
-no_behavior = model.without_group("behavior", name="no_behavior")
+no_behavior = model.without_group(
+    "behavior",
+    name="no_behavior",
+    dropouts=tuple(
+        dropout
+        for dropout in model.dropouts
+        if dropout.name not in {"behavior", "running_only"}
+    ),
+)
 
 long_cue = model.replace(
     "cue",
@@ -310,19 +339,15 @@ The experiment-specific NWB schema and default model library live in one
 module:
 
 ```python
-from gain_glm import CVConfig, Dropout
+from gain_glm import CVConfig
 from gain_glm.dynamic_routing import DEFAULT_MODEL, load_session, prepare
 
-session = load_session(nwb_path, dt=0.025)
-prepared = prepare(session, DEFAULT_MODEL, fit_window=(-0.5, 1.0))
+session = load_session(nwb_path, dt=DEFAULT_MODEL.dt)
+prepared = prepare(session, DEFAULT_MODEL)
 
 result = prepared.evaluate(
     y,
     cv=CVConfig(folds=5, seed=0),
-    dropouts=(
-        Dropout.gain("context"),
-        Dropout.group("face"),
-    ),
 )
 ```
 
@@ -332,6 +357,7 @@ Available full-model declarations are exposed through `MODELS`:
 - `no_face`
 - `no_hit_long_stim`
 - `all_response`
+- `only_baseline`
 
 The Dynamic Routing `default` model represents each stimulus with separate
 early (0–0.1 s) and late (0.1–1 s) kernels, both modulated by context. Its
@@ -346,10 +372,12 @@ gain-glm-fit \
   --nwb-path s3://path/session.nwb \
   --session-id 668755_2023-08-31 \
   --output-dir results \
-  --model default \
-  --dropout gain:context \
-  --dropout group:face
+  --model default
 ```
+
+Omitting `--dropout` uses the selected model's declared comparisons. Providing
+one or more `--dropout` arguments replaces them for that run; `--no-dropouts`
+disables them.
 
 Model comparison and SLURM launchers are in `scripts/` and take model names as
 arguments instead of requiring source edits.

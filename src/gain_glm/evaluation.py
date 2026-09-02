@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Literal
 
 import numpy as np
 
@@ -17,7 +16,13 @@ from ._solver import (
     refit_gains,
 )
 from .design import PreparedDesign
-from .model import FitConfig, FittedModel
+from .model import (
+    ConvergenceDiagnostics,
+    Dropout,
+    FitConfig,
+    FittedModel,
+    ResolvedDropout,
+)
 
 
 @dataclass(frozen=True)
@@ -34,177 +39,25 @@ class CVConfig:
 
 
 @dataclass(frozen=True)
-class Dropout:
-    """A named request to remove gains, gain terms, or predictors."""
-
-    name: str
-    remove_predictors: tuple[str, ...] = ()
-    remove_gains: tuple[str, ...] = ()
-    groups: tuple[str, ...] = ()
-    refit: Literal["auto", "gains", "full"] = "auto"
-    remove_gain_terms: tuple[tuple[str, str], ...] = ()
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "remove_predictors", tuple(self.remove_predictors))
-        object.__setattr__(self, "remove_gains", tuple(self.remove_gains))
-        gain_terms: list[tuple[str, str]] = []
-        for term in self.remove_gain_terms:
-            if isinstance(term, str):
-                raise TypeError("gain terms must be (gain, predictor) pairs")
-            pair = tuple(term)
-            if not all(isinstance(name, str) for name in pair):
-                raise TypeError("gain and predictor names must be strings")
-            if len(pair) != 2:
-                raise ValueError("gain terms must be (gain, predictor) pairs")
-            gain_terms.append(pair)
-        object.__setattr__(self, "remove_gain_terms", tuple(gain_terms))
-        object.__setattr__(self, "groups", tuple(self.groups))
-        if not self.name:
-            raise ValueError("dropout names cannot be empty")
-        if self.refit not in {"auto", "gains", "full"}:
-            raise ValueError("refit must be 'auto', 'gains', or 'full'")
-
-    @classmethod
-    def gain(
-        cls,
-        gain: str,
-        *,
-        name: str | None = None,
-        refit: Literal["auto", "gains", "full"] = "auto",
-    ) -> Dropout:
-        return cls(name or gain, remove_gains=(gain,), refit=refit)
-
-    @classmethod
-    def gain_terms(
-        cls,
-        gain: str,
-        *predictors: str,
-        name: str | None = None,
-        refit: Literal["auto", "gains", "full"] = "auto",
-    ) -> Dropout:
-        """Remove one gain's coefficient from selected predictors only."""
-        if not predictors:
-            raise ValueError("gain_terms requires at least one predictor")
-        label = name or f"{gain}:" + "+".join(predictors)
-        return cls(
-            label,
-            remove_gain_terms=tuple((gain, predictor) for predictor in predictors),
-            refit=refit,
-        )
-
-    @classmethod
-    def predictors(
-        cls,
-        *predictors: str,
-        name: str | None = None,
-        refit: Literal["auto", "full"] = "auto",
-    ) -> Dropout:
-        label = name or "+".join(predictors)
-        return cls(label, remove_predictors=tuple(predictors), refit=refit)
-
-    @classmethod
-    def group(
-        cls,
-        group: str,
-        *,
-        name: str | None = None,
-        refit: Literal["auto", "full"] = "auto",
-    ) -> Dropout:
-        return cls(name or group, groups=(group,), refit=refit)
-
-    @classmethod
-    def terms(
-        cls,
-        name: str,
-        *,
-        predictors: Sequence[str] = (),
-        gains: Sequence[str] = (),
-        gain_terms: Sequence[tuple[str, str]] = (),
-        groups: Sequence[str] = (),
-        refit: Literal["auto", "gains", "full"] = "auto",
-    ) -> Dropout:
-        """Declare a mixed reduction using any combination of term selectors."""
-        return cls(
-            name,
-            remove_predictors=tuple(predictors),
-            remove_gains=tuple(gains),
-            remove_gain_terms=tuple(gain_terms),
-            groups=tuple(groups),
-            refit=refit,
-        )
-
-    def resolve(self, prepared: PreparedDesign) -> ResolvedDropout:
-        known_predictors = set(prepared.spec.predictor_names)
-        known_gains = set(prepared.spec.gain_names)
-        known_gain_terms = set(prepared.layout.gain_coefficients)
-        unknown_predictors = set(self.remove_predictors) - known_predictors
-        unknown_gains = set(self.remove_gains) - known_gains
-        unknown_gain_terms = set(self.remove_gain_terms) - known_gain_terms
-        if unknown_predictors:
-            raise ValueError(
-                f"dropout {self.name!r} has unknown predictors: "
-                f"{sorted(unknown_predictors)}"
-            )
-        if unknown_gains:
-            raise ValueError(
-                f"dropout {self.name!r} has unknown gains: {sorted(unknown_gains)}"
-            )
-        if unknown_gain_terms:
-            raise ValueError(
-                f"dropout {self.name!r} has unknown gain terms: "
-                f"{sorted(unknown_gain_terms)}"
-            )
-
-        predictors = set(self.remove_predictors)
-        for group in self.groups:
-            matches = set(prepared.spec.group_members(group))
-            if not matches:
-                raise ValueError(
-                    f"dropout {self.name!r}: no predictors belong to group {group!r}"
-                )
-            predictors.update(matches)
-        if not predictors and not self.remove_gains and not self.remove_gain_terms:
-            raise ValueError(f"dropout {self.name!r} removes no model terms")
-
-        strategy = self.refit
-        if strategy == "auto":
-            strategy = "full" if predictors else "gains"
-        if strategy == "gains" and predictors:
-            raise ValueError(
-                f"dropout {self.name!r} removes predictors and therefore requires a full refit"
-            )
-        return ResolvedDropout(
-            name=self.name,
-            predictors=tuple(
-                p for p in prepared.spec.predictor_names if p in predictors
-            ),
-            gains=tuple(g for g in prepared.spec.gain_names if g in self.remove_gains),
-            gain_terms=tuple(
-                term
-                for term in prepared.layout.gain_coefficients
-                if term in self.remove_gain_terms
-            ),
-            refit=strategy,
-        )
-
-
-@dataclass(frozen=True)
-class ResolvedDropout:
-    name: str
-    predictors: tuple[str, ...]
-    gains: tuple[str, ...]
-    refit: Literal["gains", "full"]
-    gain_terms: tuple[tuple[str, str], ...] = ()
-
-
-@dataclass(frozen=True)
 class CVResult:
     r2_per_fold: np.ndarray
     n_iter_per_fold: np.ndarray
+    diagnostics_per_fold: tuple[ConvergenceDiagnostics, ...]
 
     @property
     def r2(self) -> float:
         return float(np.nanmean(self.r2_per_fold))
+
+    @property
+    def converged_per_fold(self) -> np.ndarray:
+        return np.asarray(
+            [diagnostics.converged for diagnostics in self.diagnostics_per_fold],
+            dtype=bool,
+        )
+
+    @property
+    def converged(self) -> bool:
+        return bool(np.all(self.converged_per_fold))
 
 
 @dataclass(frozen=True)
@@ -212,6 +65,7 @@ class DropoutResult:
     dropout: ResolvedDropout
     reduced_r2_per_fold: np.ndarray
     delta_r2_per_fold: np.ndarray
+    reduced_diagnostics_per_fold: tuple[ConvergenceDiagnostics, ...] | None = None
 
     @property
     def reduced_r2(self) -> float:
@@ -220,6 +74,18 @@ class DropoutResult:
     @property
     def delta_r2(self) -> float:
         return float(np.nanmean(self.delta_r2_per_fold))
+
+    @property
+    def reduced_converged_per_fold(self) -> np.ndarray | None:
+        if self.reduced_diagnostics_per_fold is None:
+            return None
+        return np.asarray(
+            [
+                diagnostics.converged
+                for diagnostics in self.reduced_diagnostics_per_fold
+            ],
+            dtype=bool,
+        )
 
 
 @dataclass(frozen=True)
@@ -231,6 +97,35 @@ class EvaluationResult:
 
     def to_dict(self) -> dict:
         """Return a serialization-friendly summary, including fitted kernels."""
+        cv_converged = self.cv.converged_per_fold
+
+        def dropout_summary(result: DropoutResult) -> dict:
+            reduced_converged = result.reduced_converged_per_fold
+            metric_converged = cv_converged.copy()
+            if reduced_converged is not None:
+                metric_converged &= reduced_converged
+            return {
+                "predictors": result.dropout.predictors,
+                "gains": result.dropout.gains,
+                "gain_terms": result.dropout.gain_terms,
+                "refit": result.dropout.refit,
+                "reduced_r2": result.reduced_r2,
+                "reduced_r2_per_fold": result.reduced_r2_per_fold.copy(),
+                "delta_r2": result.delta_r2,
+                "delta_r2_per_fold": result.delta_r2_per_fold.copy(),
+                "metric_converged": bool(np.all(metric_converged)),
+                "metric_converged_per_fold": metric_converged,
+                "reduced_converged_per_fold": reduced_converged,
+                "reduced_convergence_per_fold": (
+                    None
+                    if result.reduced_diagnostics_per_fold is None
+                    else [
+                        diagnostics.to_dict()
+                        for diagnostics in result.reduced_diagnostics_per_fold
+                    ]
+                ),
+            }
+
         return {
             "model": self.fit.spec.name,
             "train_r2": self.train_r2,
@@ -238,21 +133,22 @@ class EvaluationResult:
             "cv_r2_per_fold": self.cv.r2_per_fold.copy(),
             "n_iter": self.fit.n_iter,
             "n_iter_per_fold": self.cv.n_iter_per_fold.copy(),
+            # ``converged`` is retained for compatibility and describes only
+            # the final all-data fit. CV-derived metrics use the fields below.
             "converged": self.fit.converged,
+            "final_converged": self.fit.converged,
+            "final_convergence": self.fit.state.diagnostics.to_dict(),
+            "cv_converged": self.cv.converged,
+            "cv_converged_per_fold": cv_converged,
+            "cv_convergence_per_fold": [
+                diagnostics.to_dict()
+                for diagnostics in self.cv.diagnostics_per_fold
+            ],
             "intercept": self.fit.intercept,
             "kernels": self.fit.kernels(),
             "gain_table": self.fit.gain_table(),
             "dropouts": {
-                name: {
-                    "predictors": result.dropout.predictors,
-                    "gains": result.dropout.gains,
-                    "gain_terms": result.dropout.gain_terms,
-                    "refit": result.dropout.refit,
-                    "reduced_r2": result.reduced_r2,
-                    "reduced_r2_per_fold": result.reduced_r2_per_fold.copy(),
-                    "delta_r2": result.delta_r2,
-                    "delta_r2_per_fold": result.delta_r2_per_fold.copy(),
-                }
+                name: dropout_summary(result)
                 for name, result in self.dropouts.items()
             },
         }
@@ -304,7 +200,7 @@ def evaluate(
     cv_config = CVConfig() if cv is None else cv
     selected = _evaluation_mask(prepared, mask)
 
-    requests = tuple(dropouts or ())
+    requests = prepared.spec.dropouts if dropouts is None else tuple(dropouts)
     names = [dropout.name for dropout in requests]
     if len(set(names)) != len(names):
         raise ValueError("dropout names must be unique")
@@ -335,8 +231,12 @@ def evaluate(
 
     full_r2: list[float] = []
     full_iterations: list[int] = []
+    full_diagnostics: list[ConvergenceDiagnostics] = []
     reduced_r2: dict[str, list[float]] = {dropout.name: [] for dropout in resolved}
     delta_r2: dict[str, list[float]] = {dropout.name: [] for dropout in resolved}
+    reduced_diagnostics: dict[str, list[ConvergenceDiagnostics]] = {
+        dropout.name: [] for dropout in resolved
+    }
 
     for fold_number, test_trials in enumerate(folds, start=1):
         train_rows = np.isin(prepared.data.trial_index, test_trials, invert=True)
@@ -377,6 +277,7 @@ def evaluate(
         fold_full_r2 = r2_score(values[test_rows], full_prediction)
         full_r2.append(fold_full_r2)
         full_iterations.append(len(full_state.iterations))
+        full_diagnostics.append(full_state.diagnostics)
 
         for dropout in resolved:
             keep = gain_keep_mask(
@@ -386,6 +287,11 @@ def evaluate(
                 remove_predictors=dropout.predictors,
             )
             if dropout.refit == "gains":
+                full_gain_alpha = full_state.iterations[-1].gain_alpha
+                if full_gain_alpha is None:
+                    raise RuntimeError(
+                        "gain-only dropout requires a gain penalty from the full fit"
+                    )
                 reduced_gain, _ = refit_gains(
                     prepared,
                     values[train_rows],
@@ -395,6 +301,7 @@ def evaluate(
                     full_state.intercept,
                     fit_config,
                     keep=keep,
+                    alpha=full_gain_alpha,
                 )
                 reduced_beta = full_state.beta
                 reduced_intercept = full_state.intercept
@@ -416,6 +323,9 @@ def evaluate(
                 reduced_beta = reduced_state.beta
                 reduced_gain = reduced_state.gain
                 reduced_intercept = reduced_state.intercept
+                reduced_diagnostics[dropout.name].append(
+                    reduced_state.diagnostics
+                )
                 reduced_test_blocks = {
                     name: np.zeros_like(block) if name in removed else block
                     for name, block in test_blocks.items()
@@ -438,6 +348,11 @@ def evaluate(
             dropout,
             np.asarray(reduced_r2[dropout.name], dtype=float),
             np.asarray(delta_r2[dropout.name], dtype=float),
+            (
+                tuple(reduced_diagnostics[dropout.name])
+                if dropout.refit == "full"
+                else None
+            ),
         )
         for dropout in resolved
     }
@@ -447,6 +362,7 @@ def evaluate(
         cv=CVResult(
             np.asarray(full_r2, dtype=float),
             np.asarray(full_iterations, dtype=int),
+            tuple(full_diagnostics),
         ),
         dropouts=dropout_results,
     )

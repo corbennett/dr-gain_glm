@@ -55,6 +55,7 @@ def synthetic_problem(seed=0):
         ),
         gains=(Gain("context"), Gain("value")),
         name="synthetic",
+        dt=0.05,
     )
     return compile_design(spec, data), y
 
@@ -70,12 +71,91 @@ class SpecificationTests(unittest.TestCase):
         self.assertEqual(original.group_members("behavior"), ("nuisance",))
         self.assertEqual(variant.predictor_names, ("x",))
         self.assertEqual(variant.name, "task_only")
+        self.assertEqual(variant.dt, original.dt)
+        self.assertEqual(variant.fit_window, original.fit_window)
+        self.assertEqual(variant.fit_events, original.fit_events)
         self.assertEqual(changed.predictor("x").window, (-0.1, 0.1))
         self.assertEqual(original.predictor("x").window, (0, 0))
 
+    def test_model_declares_time_grid_and_event_anchored_fit_rows(self):
+        trial_index = np.repeat(np.arange(2), 5)
+        data = ModelData(
+            dt=0.1,
+            trial_index=trial_index,
+            events={"cue": np.array([0.5])},
+            signals={"x": np.arange(10)},
+        )
+        spec = ModelSpec(
+            (Signal("x", window=(0, 0), n_basis=1),),
+            dt=0.1,
+            fit_window=(-0.1, 0.2),
+            fit_events=("cue",),
+        )
+
+        prepared = compile_design(spec, data)
+
+        expected = np.zeros(10, dtype=bool)
+        expected[4:8] = True
+        np.testing.assert_array_equal(prepared.fit_mask, expected)
+
+    def test_compile_rejects_data_at_a_different_dt(self):
+        data = ModelData(
+            dt=0.2,
+            trial_index=np.repeat(np.arange(2), 5),
+            signals={"x": np.arange(10)},
+        )
+        spec = ModelSpec((Signal("x", window=(0, 0), n_basis=1),), dt=0.1)
+
+        with self.assertRaisesRegex(ValueError, "model dt 0.1 does not match"):
+            compile_design(spec, data)
+
+    def test_fit_window_requires_declared_event_sources(self):
+        with self.assertRaisesRegex(ValueError, "requires at least one fit event"):
+            ModelSpec(
+                (Signal("x", window=(0, 0), n_basis=1),),
+                dt=0.1,
+                fit_window=(-0.1, 0.2),
+            )
+
+    def test_model_validates_declared_dropouts(self):
+        predictor = (Signal("x", window=(0, 0), n_basis=1),)
+        with self.assertRaisesRegex(ValueError, "unknown predictors"):
+            ModelSpec(
+                predictor,
+                dt=0.1,
+                dropouts=(Dropout.predictors("missing"),),
+            )
+        with self.assertRaisesRegex(ValueError, "dropout names must be unique"):
+            ModelSpec(
+                predictor,
+                dt=0.1,
+                dropouts=(
+                    Dropout.predictors("x", name="duplicate"),
+                    Dropout.predictors("x", name="duplicate"),
+                ),
+            )
+
+    def test_model_transforms_preserve_or_explicitly_replace_dropouts(self):
+        spec = ModelSpec(
+            (
+                Signal("x", window=(0, 0), n_basis=1),
+                Signal("nuisance", window=(0, 0), n_basis=1),
+            ),
+            dt=0.1,
+            dropouts=(Dropout.predictors("nuisance"),),
+        )
+
+        self.assertEqual(spec.replace("x", n_basis=1).dropouts, spec.dropouts)
+        with self.assertRaisesRegex(ValueError, "unknown predictors"):
+            spec.without("nuisance")
+        without_nuisance = spec.without("nuisance", dropouts=())
+        self.assertEqual(without_nuisance.dropouts, ())
+
     def test_compile_fails_on_missing_named_source(self):
         data = ModelData(dt=0.1, trial_index=np.repeat(np.arange(2), 5))
-        spec = ModelSpec((Signal("missing", window=(0, 0), n_basis=1),))
+        spec = ModelSpec(
+            (Signal("missing", window=(0, 0), n_basis=1),), dt=0.1
+        )
         with self.assertRaisesRegex(KeyError, "signal source 'missing'"):
             compile_design(spec, data)
 
@@ -127,6 +207,31 @@ class EvaluationTests(unittest.TestCase):
         self.assertAlmostEqual(gains["context"], 0.8, delta=0.08)
         self.assertAlmostEqual(gains["value"], 0.3, delta=0.08)
 
+    def test_evaluation_uses_model_dropouts_and_empty_tuple_disables_them(self):
+        spec = ModelSpec(
+            self.prepared.spec.predictors,
+            self.prepared.spec.gains,
+            name="with_default_dropout",
+            dt=self.prepared.spec.dt,
+            dropouts=(Dropout.gain("context"),),
+        )
+        prepared = compile_design(spec, self.prepared.data)
+
+        default_result = prepared.evaluate(
+            self.y,
+            fit=self.fit,
+            cv=CVConfig(folds=3, seed=2),
+        )
+        disabled_result = prepared.evaluate(
+            self.y,
+            fit=self.fit,
+            cv=CVConfig(folds=3, seed=2),
+            dropouts=(),
+        )
+
+        self.assertEqual(tuple(default_result.dropouts), ("context",))
+        self.assertEqual(disabled_result.dropouts, {})
+
     def test_automatic_gain_alpha_is_reused_for_final_refit(self):
         import gain_glm._solver as solver
 
@@ -167,9 +272,52 @@ class EvaluationTests(unittest.TestCase):
         # comparisons use their own fixed-kernel gain refits instead.
         self.assertEqual(fit_state.call_count, 6)
         self.assertEqual(refit_gains.call_count, 6)
+        self.assertTrue(
+            all(call.kwargs["alpha"] is not None for call in refit_gains.call_args_list)
+        )
         self.assertEqual(set(result.dropouts), {"context", "value", "behavior"})
         np.testing.assert_equal(
             result.dropouts["context"].delta_r2_per_fold.shape, (3,)
+        )
+        self.assertIsNone(
+            result.dropouts["context"].reduced_diagnostics_per_fold
+        )
+        self.assertEqual(
+            len(result.dropouts["behavior"].reduced_diagnostics_per_fold), 3
+        )
+
+    def test_gain_dropout_reuses_automatically_selected_full_fold_alpha(self):
+        from gain_glm import evaluation
+
+        full_states = []
+        original_fit_state = evaluation.fit_state
+        original_refit_gains = evaluation.refit_gains
+
+        def capture_fit_state(*args, **kwargs):
+            state = original_fit_state(*args, **kwargs)
+            full_states.append(state)
+            return state
+
+        with (
+            mock.patch(
+                "gain_glm.evaluation.fit_state", side_effect=capture_fit_state
+            ),
+            mock.patch(
+                "gain_glm.evaluation.refit_gains", wraps=original_refit_gains
+            ) as refit_gains,
+        ):
+            self.prepared.evaluate(
+                self.y,
+                fit=FitConfig(kernel_alpha=1e-3, max_iter=5),
+                cv=CVConfig(folds=3, seed=4),
+                dropouts=[Dropout.gain("context")],
+            )
+
+        self.assertEqual(refit_gains.call_count, 3)
+        self.assertEqual(len(full_states), 3)
+        self.assertEqual(
+            [call.kwargs["alpha"] for call in refit_gains.call_args_list],
+            [state.iterations[-1].gain_alpha for state in full_states],
         )
 
     def test_gain_only_can_request_a_full_refit(self):
@@ -195,7 +343,25 @@ class EvaluationTests(unittest.TestCase):
             first.dropouts["context"].delta_r2_per_fold,
             second.dropouts["context"].delta_r2_per_fold,
         )
-        self.assertIn("context", first.to_dict()["dropouts"])
+        summary = first.to_dict()
+        self.assertIn("context", summary["dropouts"])
+        self.assertEqual(summary["final_converged"], first.fit.converged)
+        np.testing.assert_array_equal(
+            summary["cv_converged_per_fold"], first.cv.converged_per_fold
+        )
+        self.assertEqual(summary["cv_converged"], first.cv.converged)
+        self.assertEqual(len(summary["cv_convergence_per_fold"]), 3)
+        self.assertEqual(
+            summary["dropouts"]["context"]["metric_converged"],
+            first.cv.converged,
+        )
+        for key in (
+            "relative_mse_change",
+            "relative_prediction_change",
+            "relative_gain_change",
+            "max_abs_gain_change",
+        ):
+            self.assertTrue(np.isfinite(summary["final_convergence"][key]))
 
     def test_history_is_explicit_and_cv_can_gap_boundaries(self):
         rng = np.random.default_rng(12)
@@ -209,6 +375,7 @@ class EvaluationTests(unittest.TestCase):
                 History(window=(0.1, 0.3), n_basis=3),
             ),
             name="history",
+            dt=0.1,
         )
         prepared = compile_design(spec, data)
         result = prepared.evaluate(
@@ -223,7 +390,7 @@ class EvaluationTests(unittest.TestCase):
         trial_index = np.repeat(np.arange(4), 10)
         x = rng.normal(size=trial_index.size)
         data = ModelData(dt=0.1, trial_index=trial_index, signals={"x": x})
-        spec = ModelSpec((Signal("x", window=(0, 0), n_basis=1),))
+        spec = ModelSpec((Signal("x", window=(0, 0), n_basis=1),), dt=0.1)
         fitted = compile_design(spec, data).fit(
             0.5 + 2 * x,
             config=FitConfig(kernel_alpha=1e-8, max_iter=1),
