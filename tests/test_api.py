@@ -159,6 +159,92 @@ class SpecificationTests(unittest.TestCase):
         with self.assertRaisesRegex(KeyError, "signal source 'missing'"):
             compile_design(spec, data)
 
+    def test_signal_block_can_be_orthogonalized_against_another_predictor(self):
+        reference = np.array([-2.0, -1.0, 0.0, 1.0, 2.0, -2.0, -1.0, 0.0])
+        independent = np.array([0.5, -1.0, 0.25, 1.5, -0.75, 0.8, -0.2, 0.1])
+        feature = 3.0 + 2.5 * reference + independent
+        data = ModelData(
+            dt=0.1,
+            trial_index=np.repeat(np.arange(2), 4),
+            signals={"reference": reference, "feature": feature},
+        )
+        spec = ModelSpec(
+            (
+                Signal("reference", window=(0, 0), n_basis=1),
+                Signal(
+                    "feature",
+                    window=(0, 0.1),
+                    n_basis=2,
+                    basis="identity",
+                    orthogonalize_against="reference",
+                ),
+            ),
+            dt=0.1,
+        )
+
+        prepared = compile_design(spec, data)
+        reference_block = prepared.base_blocks["reference"][:, 0]
+        feature_block = prepared.base_blocks["feature"]
+
+        centered_reference = reference_block - reference_block.mean()
+        centered_feature = feature - feature.mean()
+        coefficient = (centered_reference @ centered_feature) / (
+            centered_reference @ centered_reference
+        )
+        residual = feature - centered_reference * coefficient
+        expected = np.column_stack((residual, np.concatenate(([0.0], residual[:-1]))))
+
+        np.testing.assert_allclose(feature_block, expected)
+        self.assertAlmostEqual(float(centered_reference @ residual), 0.0)
+        self.assertAlmostEqual(float(residual.mean()), float(feature.mean()))
+        self.assertFalse(feature_block.flags.writeable)
+
+    def test_model_validates_signal_orthogonalization_reference(self):
+        with self.assertRaisesRegex(ValueError, "unknown predictor 'missing'"):
+            ModelSpec(
+                (
+                    Signal(
+                        "x",
+                        window=(0, 0),
+                        n_basis=1,
+                        orthogonalize_against="missing",
+                    ),
+                ),
+                dt=0.1,
+            )
+        with self.assertRaisesRegex(
+            ValueError, "cannot be orthogonalized against itself"
+        ):
+            ModelSpec(
+                (
+                    Signal(
+                        "x",
+                        window=(0, 0),
+                        n_basis=1,
+                        orthogonalize_against="x",
+                    ),
+                ),
+                dt=0.1,
+            )
+        with self.assertRaisesRegex(ValueError, "dependencies contain a cycle"):
+            ModelSpec(
+                (
+                    Signal(
+                        "x",
+                        window=(0, 0),
+                        n_basis=1,
+                        orthogonalize_against="z",
+                    ),
+                    Signal(
+                        "z",
+                        window=(0, 0),
+                        n_basis=1,
+                        orthogonalize_against="x",
+                    ),
+                ),
+                dt=0.1,
+            )
+
     def test_dropout_resolves_groups_and_refit_strategy(self):
         prepared, _ = synthetic_problem()
         gain = Dropout.gain("context").resolve(prepared)

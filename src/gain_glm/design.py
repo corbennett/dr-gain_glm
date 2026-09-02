@@ -180,6 +180,50 @@ def _resample_signal(
     return _normalize(output, predictor.normalize)
 
 
+def _residualize_signal(
+    signal: np.ndarray, reference: np.ndarray, fit_mask: np.ndarray
+) -> np.ndarray:
+    """Remove a reference signal's centered projection from another signal."""
+    fitted_signal = signal[fit_mask]
+    fitted_reference = reference[fit_mask]
+    reference_mean = float(np.mean(fitted_reference))
+    signal_mean = float(np.mean(fitted_signal))
+    centered_reference = fitted_reference - reference_mean
+    centered_signal = fitted_signal - signal_mean
+    denominator = float(centered_reference @ centered_reference)
+    if denominator < 1e-12:
+        return signal.copy()
+    coefficient = float(centered_reference @ centered_signal) / denominator
+    return signal - (reference - reference_mean) * coefficient
+
+
+def _orthogonalize_signals(
+    spec: ModelSpec, signals: Mapping[str, np.ndarray], fit_mask: np.ndarray
+) -> dict[str, np.ndarray]:
+    """Apply declared orthogonalizations in dependency order."""
+    transformed = dict(signals)
+    complete: set[str] = set()
+
+    def transform(name: str) -> None:
+        if name in complete:
+            return
+        predictor = spec.predictor(name)
+        if (
+            isinstance(predictor, Signal)
+            and predictor.orthogonalize_against is not None
+        ):
+            reference_name = predictor.orthogonalize_against
+            transform(reference_name)
+            transformed[name] = _residualize_signal(
+                transformed[name], transformed[reference_name], fit_mask
+            )
+        complete.add(name)
+
+    for name in signals:
+        transform(name)
+    return transformed
+
+
 @dataclass(frozen=True)
 class ParameterLayout:
     beta_slices: Mapping[str, slice]
@@ -324,6 +368,20 @@ def compile_design(
         if not mask.any():
             raise ValueError("fit_mask selects no bins")
 
+    signal_series: dict[str, np.ndarray] = {}
+    for predictor in spec.predictors:
+        if not isinstance(predictor, Signal):
+            continue
+        if predictor.source not in data.signals:
+            raise KeyError(
+                f"signal source {predictor.source!r} required by "
+                f"{predictor.name!r} is missing"
+            )
+        signal_series[predictor.name] = _resample_signal(
+            data.signals[predictor.source], predictor, data
+        )
+    signal_series = _orthogonalize_signals(spec, signal_series, mask)
+
     lags: dict[str, np.ndarray] = {}
     bases: dict[str, np.ndarray] = {}
     blocks: dict[str, np.ndarray] = {}
@@ -353,13 +411,8 @@ def compile_design(
                 series, predictor_lags, predictor_basis
             )
         elif isinstance(predictor, Signal):
-            if predictor.source not in data.signals:
-                raise KeyError(
-                    f"signal source {predictor.source!r} required by {predictor.name!r} is missing"
-                )
-            series = _resample_signal(data.signals[predictor.source], predictor, data)
             blocks[predictor.name] = _design_block(
-                series, predictor_lags, predictor_basis
+                signal_series[predictor.name], predictor_lags, predictor_basis
             )
 
     gain_by_time: dict[str, np.ndarray] = {}

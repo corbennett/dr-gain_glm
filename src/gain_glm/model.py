@@ -59,6 +59,7 @@ class Signal:
     align: Literal["interp", "bin"] = "interp"
     normalize: Literal["none", "center", "zscore"] = "none"
     outlier_zscore: float | None = 5.0
+    orthogonalize_against: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -73,6 +74,11 @@ class Signal:
             raise ValueError("normalize must be 'none', 'center', or 'zscore'")
         if self.outlier_zscore is not None and self.outlier_zscore <= 0:
             raise ValueError("outlier_zscore must be positive or None")
+        if self.orthogonalize_against is not None and (
+            not isinstance(self.orthogonalize_against, str)
+            or not self.orthogonalize_against
+        ):
+            raise ValueError("orthogonalize_against must be a predictor name or None")
 
 
 @dataclass(frozen=True)
@@ -338,6 +344,43 @@ class ModelSpec:
             raise ValueError("predictor names must be unique")
         if len(set(gain_names)) != len(gain_names):
             raise ValueError("gain names must be unique")
+
+        predictors_by_name = {
+            predictor.name: predictor for predictor in self.predictors
+        }
+        orthogonalization_dependencies: dict[str, str] = {}
+        for predictor in self.predictors:
+            if not isinstance(predictor, Signal):
+                continue
+            reference_name = predictor.orthogonalize_against
+            if reference_name is None:
+                continue
+            if reference_name not in predictors_by_name:
+                raise ValueError(
+                    f"signal {predictor.name!r} is orthogonalized against unknown "
+                    f"predictor {reference_name!r}"
+                )
+            if reference_name == predictor.name:
+                raise ValueError(
+                    f"signal {predictor.name!r} cannot be orthogonalized against itself"
+                )
+            if not isinstance(predictors_by_name[reference_name], Signal):
+                raise TypeError(
+                    f"signal {predictor.name!r} cannot be orthogonalized against "
+                    f"non-signal predictor {reference_name!r}"
+                )
+            orthogonalization_dependencies[predictor.name] = reference_name
+
+        for name in orthogonalization_dependencies:
+            path: set[str] = set()
+            current = name
+            while current in orthogonalization_dependencies:
+                if current in path:
+                    raise ValueError(
+                        "signal orthogonalization dependencies contain a cycle"
+                    )
+                path.add(current)
+                current = orthogonalization_dependencies[current]
 
         known_gains = set(gain_names)
         used_gains: set[str] = set()

@@ -105,6 +105,11 @@ class DynamicRoutingAdapterTests(unittest.TestCase):
             tuple(dropout.name for dropout in ONLY_BASELINE_MODEL.dropouts),
             ("context_baseline",),
         )
+        for name in ("ear", "jaw", "nose", "whisker_pad"):
+            self.assertEqual(
+                ONLY_BASELINE_MODEL.predictor(name).orthogonalize_against,
+                "context_baseline",
+            )
 
 
 if __name__ == "__main__":

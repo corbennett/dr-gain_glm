@@ -110,7 +110,12 @@ prepared = compile_design(model, data)
 
 Irregular continuous signals are interpolated onto bin centers by default.
 Use `align="bin"` on a `Signal` to average samples within bins. Signals can be
-centered or z-scored as part of their declaration.
+centered or z-scored as part of their declaration. A signal can also declare
+`orthogonalize_against="predictor_name"`. During preparation, that resampled
+signal is residualized against the named signal before its temporal design
+block is constructed. The least-squares projection is estimated on the
+prepared fit rows after centering both signals, so the signal's mean is
+preserved.
 
 `compile_design` validates that `data.dt` matches `model.dt`, resolves the
 model's event-anchored fit window, and validates all source names and dimensions
