@@ -1,11 +1,12 @@
 import argparse
 import pickle
 import unittest
+from unittest import mock
 
 import numpy as np
 
 from gain_glm import ModelData, ModelSpec, Signal, compile_design
-from gain_glm.batch import compare_models, parse_dropout
+from gain_glm.batch import compare_models, main, parse_dropout, parse_positive_float
 
 
 class BatchTests(unittest.TestCase):
@@ -18,6 +19,39 @@ class BatchTests(unittest.TestCase):
         )
         with self.assertRaises(argparse.ArgumentTypeError):
             parse_dropout("context")
+
+    def test_positive_float_parser_rejects_invalid_dt(self):
+        self.assertEqual(parse_positive_float("0.05"), 0.05)
+        for value in ("0", "-0.1", "nan", "inf"):
+            with (
+                self.subTest(value=value),
+                self.assertRaises(argparse.ArgumentTypeError),
+            ):
+                parse_positive_float(value)
+
+    def test_cli_forwards_cv_options_and_overrides_model_dt(self):
+        with mock.patch("gain_glm.batch.fit_session") as fit_session:
+            main(
+                [
+                    "--nwb-path",
+                    "session.nwb",
+                    "--session-id",
+                    "session",
+                    "--output-dir",
+                    "results",
+                    "--folds",
+                    "7",
+                    "--fold-seed",
+                    "13",
+                    "--dt",
+                    "0.05",
+                ]
+            )
+
+        options = fit_session.call_args.kwargs
+        self.assertEqual(options["cv"].folds, 7)
+        self.assertEqual(options["cv"].seed, 13)
+        self.assertEqual(options["model"].dt, 0.05)
 
     def test_prepared_design_is_process_serializable(self):
         trial_index = np.repeat(np.arange(3), 4)

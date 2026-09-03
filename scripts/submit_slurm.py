@@ -7,6 +7,7 @@ block below. Use ``--dry-run`` to inspect commands before submission.
 import argparse
 import json
 from dataclasses import asdict
+from dataclasses import replace as dataclass_replace
 from datetime import datetime
 from pathlib import Path
 
@@ -15,18 +16,20 @@ from dr_datacube import datacube_config, get_session_ids_from_github, list_nwb_s
 from simple_slurm import Slurm
 
 from gain_glm import FitConfig
+from gain_glm.batch import parse_positive_float
 from gain_glm.dynamic_routing import MODELS
 
 REPO_DIR = Path(__file__).resolve().parents[1]
 PYTHON = str(REPO_DIR / ".venv/bin/python")
 OUTPUT_DIR = "/allen//programs/mindscope/workgroups/dynamicrouting/corbettb/gain_glm"
 LOG_DIR = REPO_DIR / "logs"
-PARTITION = 'braintv'
+PARTITION = "braintv"
 CPUS = 8
 MEMORY = "32G"
 WALLTIME = "4:00:00"
 
-datacube_config.use_cache=True
+datacube_config.use_cache = True
+
 
 def sessions() -> pl.DataFrame:
     good_session_ids = set(get_session_ids_from_github("brainwide"))
@@ -75,17 +78,53 @@ def slurm_job(session_id: str) -> Slurm:
     return Slurm(**options)
 
 
+def fit_command(
+    nwb_path: str,
+    session_id: str,
+    output_dir: Path,
+    *,
+    model: str,
+    max_iter: int,
+    folds: int,
+    fold_seed: int | None = None,
+    dt: float | None = None,
+    unit_limit: int | None = None,
+    overwrite: bool = False,
+) -> str:
+    """Build the batch-fitting command run inside one SLURM job."""
+    command = (
+        "export LAZYNWB_CATALOG_CACHE_PATH="
+        '"${SLURM_TMPDIR:-/tmp}/lazynwb/catalog-${SLURM_JOB_ID}.sqlite"; '
+        f"{PYTHON} -m gain_glm.batch "
+        f"--nwb-path {nwb_path} --session-id {session_id} "
+        f"--output-dir {output_dir} --model {model} "
+        f"--max-iter {max_iter} --folds {folds}"
+    )
+    if fold_seed is not None:
+        command += f" --fold-seed {fold_seed}"
+    if dt is not None:
+        command += f" --dt {dt}"
+    if unit_limit is not None:
+        command += f" --limit {unit_limit}"
+    if overwrite:
+        command += " --overwrite"
+    return command
+
+
 def save_run_params(
     output_dir: Path,
     args: argparse.Namespace,
     session_ids: list[str],
 ) -> None:
+    model = MODELS[args.model]
+    if args.dt is not None:
+        model = dataclass_replace(model, dt=args.dt)
     params = {
         "output_dir": str(output_dir),
         "arguments": vars(args),
         "session_ids": session_ids,
-        "model": asdict(MODELS[args.model]),
-        "dropouts": [asdict(dropout) for dropout in MODELS[args.model].dropouts],
+        "model": asdict(model),
+        "dropouts": [asdict(dropout) for dropout in model.dropouts],
     }
     with (output_dir / "run_params.json").open("w") as stream:
         json.dump(params, stream, indent=2)
@@ -98,6 +137,13 @@ def main() -> None:
     parser.add_argument("--limit", type=int)
     parser.add_argument("--unit-limit", type=int)
     parser.add_argument("--model", choices=MODELS, default="default")
+    parser.add_argument("--folds", type=int, default=5)
+    parser.add_argument("--fold-seed", type=int)
+    parser.add_argument(
+        "--dt",
+        type=parse_positive_float,
+        help="Override the selected model's time-bin width in seconds",
+    )
     parser.add_argument("--max-iter", type=int, default=FitConfig().max_iter)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument(
@@ -114,21 +160,23 @@ def main() -> None:
         table["session_id"].to_list(), run_output_dir, overwrite=args.overwrite
     )
     if len(session_ids) != table.height:
-        print(f"skipping {table.height - len(session_ids)} sessions with existing output")
+        print(
+            f"skipping {table.height - len(session_ids)} sessions with existing output"
+        )
         table = table.filter(pl.col("session_id").is_in(session_ids))
     for row in table.iter_rows(named=True):
-        command = (
-            'export LAZYNWB_CATALOG_CACHE_PATH='
-            '"${SLURM_TMPDIR:-/tmp}/lazynwb/catalog-${SLURM_JOB_ID}.sqlite"; '
-            f"{PYTHON} -m gain_glm.batch "
-            f"--nwb-path {row['nwb_path']} --session-id {row['session_id']} "
-            f"--output-dir {run_output_dir} --model {args.model} "
-            f"--max-iter {args.max_iter}"
+        command = fit_command(
+            row["nwb_path"],
+            row["session_id"],
+            run_output_dir,
+            model=args.model,
+            max_iter=args.max_iter,
+            folds=args.folds,
+            fold_seed=args.fold_seed,
+            dt=args.dt,
+            unit_limit=args.unit_limit,
+            overwrite=args.overwrite,
         )
-        if args.unit_limit:
-            command += f" --limit {args.unit_limit}"
-        if args.overwrite:
-            command += " --overwrite"
         job = slurm_job(row["session_id"])
         if args.dry_run:
             print(job)

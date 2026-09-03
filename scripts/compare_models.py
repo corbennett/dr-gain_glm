@@ -1,11 +1,12 @@
 """Compare named full-model variants on a small set of units."""
 
 import argparse
+from dataclasses import replace as dataclass_replace
 
 import polars.selectors as cs
 
 from gain_glm import CVConfig, FitConfig
-from gain_glm.batch import compare_models, parse_dropout
+from gain_glm.batch import compare_models, parse_dropout, parse_positive_float
 from gain_glm.dynamic_routing import MODELS
 
 
@@ -20,12 +21,21 @@ def main() -> None:
     parser.add_argument("--dropout", action="append", type=parse_dropout)
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--fold-seed", type=int)
+    parser.add_argument(
+        "--dt",
+        type=parse_positive_float,
+        help="Override the selected models' time-bin width in seconds",
+    )
     parser.add_argument("--max-iter", type=int, default=FitConfig().max_iter)
     args = parser.parse_args()
 
+    models = [MODELS[name] for name in args.models]
+    if args.dt is not None:
+        models = [dataclass_replace(model, dt=args.dt) for model in models]
+
     table = compare_models(
         args.nwb_path,
-        [MODELS[name] for name in args.models],
+        models,
         unit_ids=args.units,
         unit_limit=args.unit_limit,
         dropouts=args.dropout,

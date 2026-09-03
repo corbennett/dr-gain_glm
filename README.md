@@ -382,15 +382,32 @@ gain-glm-fit \
   --nwb-path s3://path/session.nwb \
   --session-id 668755_2023-08-31 \
   --output-dir results \
-  --model default
+  --model default \
+  --dt 0.025 \
+  --folds 5 \
+  --fold-seed 0
 ```
 
 Omitting `--dropout` uses the selected model's declared comparisons. Providing
 one or more `--dropout` arguments replaces them for that run; `--no-dropouts`
-disables them.
+disables them. Omitting `--dt` uses the selected model's declared time-bin
+width. Omitting `--fold-seed` leaves trials in trial-ID order, while supplying
+an integer reproducibly randomizes whole trials among folds.
 
 Model comparison and SLURM launchers are in `scripts/` and take model names as
-arguments instead of requiring source edits.
+arguments instead of requiring source edits. The SLURM launcher forwards the
+same time-grid and outer-CV options to every session job:
+
+```bash
+python scripts/submit_slurm.py \
+  --model default \
+  --dt 0.025 \
+  --folds 5 \
+  --fold-seed 0 \
+  --dry-run
+```
+
+Remove `--dry-run` after inspecting the generated commands to submit the jobs.
 
 ## Spike history
 

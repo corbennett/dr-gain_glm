@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from collections.abc import Sequence
+from dataclasses import replace as dataclass_replace
 from pathlib import Path
 from typing import Any
 
@@ -179,6 +180,14 @@ def parse_dropout(value: str) -> Dropout:
     raise argparse.ArgumentTypeError(f"unknown dropout kind {kind!r}")
 
 
+def parse_positive_float(value: str) -> float:
+    """Parse a finite, positive command-line float."""
+    parsed = float(value)
+    if not np.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be a finite positive number")
+    return parsed
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--nwb-path", required=True)
@@ -199,17 +208,25 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--fold-seed", type=int)
+    parser.add_argument(
+        "--dt",
+        type=parse_positive_float,
+        help="Override the selected model's time-bin width in seconds",
+    )
     parser.add_argument("--max-iter", type=int, default=FitConfig().max_iter)
     parser.add_argument("--n-jobs", type=int, default=-1)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--qc-column", default=QC_COLUMN)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args(argv)
+    model = MODELS[args.model]
+    if args.dt is not None:
+        model = dataclass_replace(model, dt=args.dt)
     fit_session(
         args.nwb_path,
         args.session_id,
         args.output_dir,
-        model=MODELS[args.model],
+        model=model,
         dropouts=() if args.no_dropouts else args.dropout,
         fit=FitConfig(max_iter=args.max_iter),
         cv=CVConfig(folds=args.folds, seed=args.fold_seed),
