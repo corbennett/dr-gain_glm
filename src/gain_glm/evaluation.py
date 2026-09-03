@@ -43,6 +43,7 @@ class CVResult:
     r2_per_fold: np.ndarray
     n_iter_per_fold: np.ndarray
     diagnostics_per_fold: tuple[ConvergenceDiagnostics, ...]
+    r2_pooled: float = float("nan")
 
     @property
     def r2(self) -> float:
@@ -66,6 +67,8 @@ class DropoutResult:
     reduced_r2_per_fold: np.ndarray
     delta_r2_per_fold: np.ndarray
     reduced_diagnostics_per_fold: tuple[ConvergenceDiagnostics, ...] | None = None
+    reduced_r2_pooled: float = float("nan")
+    delta_r2_pooled: float = float("nan")
 
     @property
     def reduced_r2(self) -> float:
@@ -111,8 +114,10 @@ class EvaluationResult:
                 "refit": result.dropout.refit,
                 "reduced_r2": result.reduced_r2,
                 "reduced_r2_per_fold": result.reduced_r2_per_fold.copy(),
+                "reduced_r2_pooled": result.reduced_r2_pooled,
                 "delta_r2": result.delta_r2,
                 "delta_r2_per_fold": result.delta_r2_per_fold.copy(),
+                "delta_r2_pooled": result.delta_r2_pooled,
                 "metric_converged": bool(np.all(metric_converged)),
                 "metric_converged_per_fold": metric_converged,
                 "reduced_converged_per_fold": reduced_converged,
@@ -131,6 +136,7 @@ class EvaluationResult:
             "train_r2": self.train_r2,
             "cv_r2": self.cv.r2,
             "cv_r2_per_fold": self.cv.r2_per_fold.copy(),
+            "cv_r2_pooled": self.cv.r2_pooled,
             "n_iter": self.fit.n_iter,
             "n_iter_per_fold": self.cv.n_iter_per_fold.copy(),
             # ``converged`` is retained for compatibility and describes only
@@ -177,6 +183,14 @@ def _evaluation_mask(prepared: PreparedDesign, mask: np.ndarray | None) -> np.nd
     if not selected.any():
         raise ValueError("mask selects no bins")
     return selected
+
+
+def _r2_from_sse(target: np.ndarray, squared_error: float) -> float:
+    """Score pooled held-out residuals against one global target mean."""
+    total = float(np.sum((target - target.mean()) ** 2))
+    if total <= 0:
+        return float("nan")
+    return 1 - squared_error / total
 
 
 def evaluate(
@@ -230,10 +244,15 @@ def evaluate(
         )
 
     full_r2: list[float] = []
+    pooled_targets: list[np.ndarray] = []
+    full_squared_error = 0.0
     full_iterations: list[int] = []
     full_diagnostics: list[ConvergenceDiagnostics] = []
     reduced_r2: dict[str, list[float]] = {dropout.name: [] for dropout in resolved}
     delta_r2: dict[str, list[float]] = {dropout.name: [] for dropout in resolved}
+    reduced_squared_error: dict[str, float] = {
+        dropout.name: 0.0 for dropout in resolved
+    }
     reduced_diagnostics: dict[str, list[ConvergenceDiagnostics]] = {
         dropout.name: [] for dropout in resolved
     }
@@ -274,8 +293,11 @@ def evaluate(
             full_state.gain,
             full_state.intercept,
         )
-        fold_full_r2 = r2_score(values[test_rows], full_prediction)
+        fold_target = values[test_rows]
+        fold_full_r2 = r2_score(fold_target, full_prediction)
         full_r2.append(fold_full_r2)
+        pooled_targets.append(fold_target)
+        full_squared_error += float(np.sum((fold_target - full_prediction) ** 2))
         full_iterations.append(len(full_state.iterations))
         full_diagnostics.append(full_state.diagnostics)
 
@@ -339,16 +361,34 @@ def evaluate(
                 reduced_gain,
                 reduced_intercept,
             )
-            fold_reduced_r2 = r2_score(values[test_rows], reduced_prediction)
+            fold_reduced_r2 = r2_score(fold_target, reduced_prediction)
             reduced_r2[dropout.name].append(fold_reduced_r2)
             delta_r2[dropout.name].append(fold_full_r2 - fold_reduced_r2)
+            reduced_squared_error[dropout.name] += float(
+                np.sum((fold_target - reduced_prediction) ** 2)
+            )
+
+    pooled_target = np.concatenate(pooled_targets)
+    full_r2_pooled = _r2_from_sse(pooled_target, full_squared_error)
+    reduced_r2_pooled = {
+        dropout.name: _r2_from_sse(
+            pooled_target, reduced_squared_error[dropout.name]
+        )
+        for dropout in resolved
+    }
 
     dropout_results = {
         dropout.name: DropoutResult(
-            dropout,
-            np.asarray(reduced_r2[dropout.name], dtype=float),
-            np.asarray(delta_r2[dropout.name], dtype=float),
-            (
+            dropout=dropout,
+            reduced_r2_per_fold=np.asarray(
+                reduced_r2[dropout.name], dtype=float
+            ),
+            delta_r2_per_fold=np.asarray(delta_r2[dropout.name], dtype=float),
+            reduced_r2_pooled=reduced_r2_pooled[dropout.name],
+            delta_r2_pooled=(
+                full_r2_pooled - reduced_r2_pooled[dropout.name]
+            ),
+            reduced_diagnostics_per_fold=(
                 tuple(reduced_diagnostics[dropout.name])
                 if dropout.refit == "full"
                 else None
@@ -360,9 +400,10 @@ def evaluate(
         fit=fitted,
         train_r2=train_r2,
         cv=CVResult(
-            np.asarray(full_r2, dtype=float),
-            np.asarray(full_iterations, dtype=int),
-            tuple(full_diagnostics),
+            r2_per_fold=np.asarray(full_r2, dtype=float),
+            r2_pooled=full_r2_pooled,
+            n_iter_per_fold=np.asarray(full_iterations, dtype=int),
+            diagnostics_per_fold=tuple(full_diagnostics),
         ),
         dropouts=dropout_results,
     )

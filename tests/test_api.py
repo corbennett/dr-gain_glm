@@ -372,6 +372,46 @@ class EvaluationTests(unittest.TestCase):
             len(result.dropouts["behavior"].reduced_diagnostics_per_fold), 3
         )
 
+    def test_pooled_scores_use_one_tss_for_all_held_out_predictions(self):
+        cv = CVConfig(folds=3, seed=4)
+        result = self.prepared.evaluate(
+            self.y,
+            fit=self.fit,
+            cv=cv,
+            dropouts=[Dropout.gain("context")],
+        )
+
+        trials = np.unique(self.prepared.data.trial_index)
+        trials = np.random.default_rng(cv.seed).permutation(trials)
+        folds = np.array_split(trials, cv.folds)
+        fold_tss = np.asarray(
+            [
+                np.sum(
+                    (
+                        self.y[np.isin(self.prepared.data.trial_index, fold)]
+                        - self.y[
+                            np.isin(self.prepared.data.trial_index, fold)
+                        ].mean()
+                    )
+                    ** 2
+                )
+                for fold in folds
+            ]
+        )
+        global_tss = np.sum((self.y - self.y.mean()) ** 2)
+        expected_full = 1 - np.sum((1 - result.cv.r2_per_fold) * fold_tss) / global_tss
+
+        dropout = result.dropouts["context"]
+        expected_reduced = 1 - np.sum(
+            (1 - dropout.reduced_r2_per_fold) * fold_tss
+        ) / global_tss
+
+        self.assertAlmostEqual(result.cv.r2_pooled, expected_full)
+        self.assertAlmostEqual(dropout.reduced_r2_pooled, expected_reduced)
+        self.assertAlmostEqual(
+            dropout.delta_r2_pooled, expected_full - expected_reduced
+        )
+
     def test_gain_dropout_reuses_automatically_selected_full_fold_alpha(self):
         from gain_glm import evaluation
 
@@ -431,6 +471,15 @@ class EvaluationTests(unittest.TestCase):
         )
         summary = first.to_dict()
         self.assertIn("context", summary["dropouts"])
+        self.assertEqual(summary["cv_r2_pooled"], first.cv.r2_pooled)
+        self.assertEqual(
+            summary["dropouts"]["context"]["reduced_r2_pooled"],
+            first.dropouts["context"].reduced_r2_pooled,
+        )
+        self.assertEqual(
+            summary["dropouts"]["context"]["delta_r2_pooled"],
+            first.dropouts["context"].delta_r2_pooled,
+        )
         self.assertEqual(summary["final_converged"], first.fit.converged)
         np.testing.assert_array_equal(
             summary["cv_converged_per_fold"], first.cv.converged_per_fold

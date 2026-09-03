@@ -94,7 +94,8 @@ def fit_session(
         "units": dict(results),
     }
     with output_path.open("w") as stream:
-        json.dump(payload, stream, default=_json_default)
+        json.dump(payload, stream, default=_json_default, indent=2)
+        stream.write("\n")
     return output_path
 
 

@@ -304,7 +304,12 @@ Use `Dropout.gain("context", refit="full")` to ask the alternative scientific
 question in which all remaining parameters adapt after removing a gain.
 
 Each `DropoutResult` records the resolved predictor names, gain names, refit
-strategy, reduced R², and ΔR² for every fold.
+strategy, reduced R², and ΔR² for every fold. It also reports
+`reduced_r2_pooled` and `delta_r2_pooled`, computed by pooling all held-out
+residuals and normalizing them once against the TSS of all held-out targets.
+The full model's corresponding score is `result.cv.r2_pooled` (serialized as
+`cv_r2_pooled`). The existing `r2` and `delta_r2` fields remain the unweighted
+means of the fold-specific scores.
 
 For every outer fold, reduced models are evaluated on the same test rows as the
 full model. The reported per-fold quantity is
