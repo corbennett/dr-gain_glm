@@ -86,7 +86,11 @@ term and input should have different names.
 `dt` fixes the model's sampling interval. When `fit_window` is present,
 `fit_events` names the event sources around which that window selects training
 and scoring rows. These are separate from each predictor's `window`, which
-defines the temporal support of its convolutional kernel.
+defines the temporal support of its convolutional kernel. A window is specified
+by the beginning of its first bin and the end of its final bin: on a grid with
+spacing `dt`, `(0.0, 0.1)` selects bins beginning at 0, 0.025, 0.05, and 0.075
+when `dt=0.025`. The final selected bin therefore ends at 0.1. A zero-width
+window such as `(0.0, 0.0)` remains the shorthand for one bin.
 
 ## Supply data and prepare once
 

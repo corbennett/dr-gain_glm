@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from .data import ModelData, TimedSignal, windows_mask
+from .data import ModelData, TimedSignal, _window_bin_bounds, windows_mask
 from .model import Event, FitConfig, FittedModel, History, ModelSpec, Signal
 
 if TYPE_CHECKING:
@@ -71,9 +71,8 @@ def make_basis(name: str, n_basis: int, n_lag_bins: int) -> np.ndarray:
 
 
 def _lags(window: tuple[float, float], dt: float) -> np.ndarray:
-    low = int(np.floor(window[0] / dt))
-    high = int(np.ceil(window[1] / dt))
-    return np.arange(low, high + 1)
+    low, high = _window_bin_bounds(window, dt)
+    return np.arange(low, high)
 
 
 def _event_series(times: np.ndarray, dt: float, n_time: int) -> np.ndarray:

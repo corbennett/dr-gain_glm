@@ -169,20 +169,38 @@ def make_trial_index(
     return trial_index
 
 
+def _window_bin_bounds(
+    window: tuple[float, float], dt: float
+) -> tuple[int, int]:
+    """Return the first bin and exclusive end edge for a time window.
+
+    The lower bound is the beginning of the first selected bin. The upper
+    bound is the end of the final selected bin, so it becomes an exclusive
+    bin edge after rounding to the model grid. A zero-width window retains
+    the package's existing one-bin shorthand.
+    """
+    if window[1] < window[0]:
+        raise ValueError(f"invalid window: {window!r}")
+    low = int(np.floor(window[0] / dt))
+    high = int(np.ceil(window[1] / dt))
+    if high == low:
+        high = low + 1
+    return low, high
+
+
 def windows_mask(
     event_times: np.ndarray,
     n_time: int,
     dt: float,
     window: tuple[float, float] = (-1.0, 2.0),
 ) -> np.ndarray:
-    """Mark bins within ``window`` seconds of any event."""
+    """Mark bins whose window runs from its lower bound to upper edge."""
     mask = np.zeros(n_time, dtype=bool)
     if event_times is None:
         return mask
-    low = int(np.floor(window[0] / dt))
-    high = int(np.ceil(window[1] / dt))
+    low, high = _window_bin_bounds(window, dt)
     for event_bin in np.floor(np.asarray(event_times) / dt).astype(int):
         first = max(0, event_bin + low)
-        last = min(n_time, event_bin + high + 1)
+        last = min(n_time, event_bin + high)
         mask[first:last] = True
     return mask

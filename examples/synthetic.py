@@ -91,7 +91,7 @@ def main() -> None:
         predictors=(
             Event(
                 "cue",
-                window=(0, (kernel_bins - 1) * dt),
+                window=(0, kernel_bins * dt),
                 n_basis=kernel_bins,
                 basis="identity",
                 gains=("context",),

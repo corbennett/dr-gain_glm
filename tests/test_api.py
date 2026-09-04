@@ -6,6 +6,7 @@ import numpy as np
 from gain_glm import (
     CVConfig,
     Dropout,
+    Event,
     FitConfig,
     Gain,
     History,
@@ -95,8 +96,32 @@ class SpecificationTests(unittest.TestCase):
         prepared = compile_design(spec, data)
 
         expected = np.zeros(10, dtype=bool)
-        expected[4:8] = True
+        expected[4:7] = True
         np.testing.assert_array_equal(prepared.fit_mask, expected)
+
+    def test_window_upper_bound_is_the_end_of_the_final_bin(self):
+        data = ModelData(
+            dt=0.1,
+            trial_index=np.repeat(np.arange(2), 5),
+            events={"cue": np.array([0.2])},
+        )
+        spec = ModelSpec(
+            (
+                Event(
+                    "cue",
+                    window=(0, 0.2),
+                    n_basis=2,
+                    basis="identity",
+                ),
+            ),
+            dt=0.1,
+        )
+
+        prepared = compile_design(spec, data)
+
+        np.testing.assert_array_equal(prepared.lags["cue"], [0, 1])
+        nonzero_rows = np.flatnonzero(prepared.base_blocks["cue"].any(axis=1))
+        np.testing.assert_array_equal(nonzero_rows, [2, 3])
 
     def test_compile_rejects_data_at_a_different_dt(self):
         data = ModelData(
@@ -173,7 +198,7 @@ class SpecificationTests(unittest.TestCase):
                 Signal("reference", window=(0, 0), n_basis=1),
                 Signal(
                     "feature",
-                    window=(0, 0.1),
+                    window=(0, 0.2),
                     n_basis=2,
                     basis="identity",
                     orthogonalize_against="reference",
