@@ -154,7 +154,7 @@ BEHAVIOR_PREDICTORS = (
 )
 
 DEFAULT_DROPOUTS = (
-    Dropout.gain("context"),
+    # Dropout.gain("context"),
     Dropout.gain_terms(
         "context",
         *STIMULUS_EVENTS,
@@ -165,6 +165,16 @@ DEFAULT_DROPOUTS = (
         *LATE_STIMULUS_PREDICTOR_NAMES,
         name="late_stim_context_gain",
     ),
+    Dropout.gain_terms(
+        "context",
+        "rewards",
+        name="reward_context_gain",
+    ),
+    Dropout.gain_terms(
+        "context",
+        "licks",
+        name="lick_context_gain",
+        ),
     Dropout.predictors("context_baseline"),
 )
 
