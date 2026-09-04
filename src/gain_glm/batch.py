@@ -21,7 +21,6 @@ from .dynamic_routing import (
     QC_COLUMN,
     load_session,
     load_unit_target,
-    model_data,
     prepare,
     qc_unit_ids,
 )
@@ -74,7 +73,7 @@ def fit_session(
     units = qc_unit_ids(nwb_path, qc_column=qc_column)
     if limit is not None:
         units = units[:limit]
-    session = load_session(nwb_path, dt=model.dt)
+    session = load_session(nwb_path, model)
     prepared = prepare(session, model)
     targets = {unit: load_unit_target(session, unit) for unit in units}
     fit_config = FitConfig() if fit is None else fit
@@ -122,8 +121,8 @@ def compare_models(
         for model in models[1:]
     ):
         raise ValueError("compared models must use the same fit window and events")
-    session = load_session(nwb_path, dt=reference.dt)
-    inputs = model_data(session)
+    session = load_session(nwb_path, *models)
+    inputs = session.data
     prepared = {model.name: compile_design(model, inputs) for model in models}
     if len(prepared) != len(models):
         raise ValueError("model names must be unique")

@@ -352,7 +352,7 @@ module:
 from gain_glm import CVConfig
 from gain_glm.dynamic_routing import DEFAULT_MODEL, load_session, prepare
 
-session = load_session(nwb_path, dt=DEFAULT_MODEL.dt)
+session = load_session(nwb_path, DEFAULT_MODEL)
 prepared = prepare(session, DEFAULT_MODEL)
 
 result = prepared.evaluate(
@@ -360,6 +360,10 @@ result = prepared.evaluate(
     cv=CVConfig(folds=5, seed=0),
 )
 ```
+
+`load_session` inspects the model's event, signal, fit-event, and gain sources
+and reads only the corresponding NWB streams. Pass multiple models as
+additional arguments to load their union once for model comparisons.
 
 Available full-model declarations are exposed through `MODELS`:
 

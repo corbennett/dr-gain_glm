@@ -253,6 +253,20 @@ ONLY_BASELINE_MODEL = ModelSpec(
             orthogonalize_against="context_baseline",
         ),
         Signal(
+            "running_speed",
+            window=(-0.5, 0.5),
+            n_basis=10,
+            normalize="zscore",
+            groups=("behavior",),
+        ),
+        Signal(
+            "pupil_area",
+            window=(-0.5, 0.5),
+            n_basis=10,
+            normalize="zscore",
+            groups=("behavior",),
+        ),
+        Signal(
             "time",
             window=(0, 0),
             n_basis=1,
@@ -282,161 +296,238 @@ MODELS: Mapping[str, ModelSpec] = {
 
 @dataclass(frozen=True)
 class SessionData:
+    """Session bounds and the model-specific inputs loaded from NWB."""
+
     nwb_path: str
-    dt: float
     task_start_time: float
     task_end_time: float
-    n_time: int
-    trials: pl.DataFrame
-    trial_start_times: np.ndarray
-    trial_end_times: np.ndarray
-    trial_context: np.ndarray
-    lick_times: np.ndarray
-    reward_times: np.ndarray
-    running_speed: np.ndarray
-    pupil: np.ndarray
-    pose: pl.DataFrame
-    side_frame_times: np.ndarray
+    data: ModelData
+
+    @property
+    def dt(self) -> float:
+        return self.data.dt
+
+    @property
+    def n_time(self) -> int:
+        return self.data.n_time
 
 
-def load_session(nwb_path: str, *, dt: float = DEFAULT_DT) -> SessionData:
-    """Read each session-level NWB stream once."""
-    trials = lazynwb.read_nwb(nwb_path, "/intervals/trials")
-    starts = trials.select("start_time").to_numpy().ravel()
-    ends = trials.select("stop_time").to_numpy().ravel()
-    task_start = float(starts[0])
-    task_end = float(ends[-1])
-    n_time = int(np.floor((task_end - task_start) / dt))
-
-    licks = (
-        lazynwb.scan_nwb(nwb_path, "/processing/behavior/licks")
-        .select("timestamps")
-        .collect()
-        .to_numpy()
-        .ravel()
-    )
-    rewards = (
-        lazynwb.scan_nwb(nwb_path, "/processing/behavior/rewards")
-        .select("timestamps")
-        .collect()
-        .to_numpy()
-        .ravel()
-    )
-    running = (
-        lazynwb.scan_nwb(nwb_path, "/processing/behavior/running_speed")
-        .select("timestamps", "data")
-        .collect()
-        .to_numpy()
-    )
-    pupil = (
-        lazynwb.scan_nwb(nwb_path, "/processing/behavior/eye_tracking")
-        .filter(~pl.col("pupil_is_bad_frame"))
-        .select("timestamps", "pupil_area")
-        .collect()
-        .to_numpy()
-    )
-    pose = lazynwb.scan_nwb(nwb_path, "/processing/behavior/lp_side_camera").collect()
-    side_times = (
-        lazynwb.scan_nwb(nwb_path, "/acquisition/frametimes_side_camera")
-        .select("timestamps")
-        .collect()
-        .to_numpy()
-        .ravel()
-    )
-    context = trials["is_vis_rewarded"].to_numpy().astype(int) * 2 - 1
-    return SessionData(
-        nwb_path=nwb_path,
-        dt=dt,
-        task_start_time=task_start,
-        task_end_time=task_end,
-        n_time=n_time,
-        trials=trials,
-        trial_start_times=starts,
-        trial_end_times=ends,
-        trial_context=context,
-        lick_times=licks,
-        reward_times=rewards,
-        running_speed=running,
-        pupil=pupil,
-        pose=pose,
-        side_frame_times=side_times,
-    )
+_TRIAL_EVENT_SOURCES = frozenset((*STIMULUS_EVENTS, *OUTCOME_EVENTS))
+_FACE_SIGNAL_FEATURES = {
+    "ear": "ear_base_l",
+    "jaw": "jaw",
+    "nose": "nose_tip",
+    "whisker_pad": "whisker_pad_l_side",
+}
+_SUPPORTED_EVENT_SOURCES = _TRIAL_EVENT_SOURCES | {"licks", "rewards"}
+_SUPPORTED_SIGNAL_SOURCES = frozenset(
+    {"running_speed", "pupil_area", "context_baseline", "time"}
+    | _FACE_SIGNAL_FEATURES.keys()
+)
+_SUPPORTED_TRIAL_VALUE_SOURCES = frozenset({"trial_context"})
 
 
-def _trial_events(session: SessionData, column: str) -> np.ndarray:
-    if column not in session.trials.columns:
+def _required_sources(
+    models: tuple[ModelSpec, ...],
+) -> tuple[set[str], set[str], set[str]]:
+    event_sources = {
+        predictor.source
+        for model in models
+        for predictor in model.predictors
+        if isinstance(predictor, Event) and predictor.source is not None
+    }
+    event_sources.update(source for model in models for source in model.fit_events)
+    signal_sources = {
+        predictor.source
+        for model in models
+        for predictor in model.predictors
+        if isinstance(predictor, Signal) and predictor.source is not None
+    }
+    trial_value_sources = {
+        gain.source
+        for model in models
+        for gain in model.gains
+        if gain.source is not None
+    }
+    return event_sources, signal_sources, trial_value_sources
+
+
+def _validate_sources(
+    event_sources: set[str],
+    signal_sources: set[str],
+    trial_value_sources: set[str],
+) -> None:
+    unknown = {
+        "event": event_sources - _SUPPORTED_EVENT_SOURCES,
+        "signal": signal_sources - _SUPPORTED_SIGNAL_SOURCES,
+        "trial value": trial_value_sources - _SUPPORTED_TRIAL_VALUE_SOURCES,
+    }
+    details = [f"{kind}s {sorted(names)}" for kind, names in unknown.items() if names]
+    if details:
+        raise ValueError(
+            "unsupported Dynamic Routing model sources: " + "; ".join(details)
+        )
+
+
+def _trial_events(
+    trials: pl.DataFrame, task_start_time: float, column: str
+) -> np.ndarray:
+    if column not in trials.columns:
         return np.zeros(0)
     return (
-        session.trials.filter(pl.col(column).fill_null(False))
+        trials.filter(pl.col(column).fill_null(False))
         .select("stim_start_time")["stim_start_time"]
         .drop_nulls()
         .to_numpy()
-        - session.task_start_time
+        - task_start_time
     )
 
 
 def _pose_signal(
-    session: SessionData,
+    pose: pl.DataFrame,
+    side_frame_times: np.ndarray,
+    task_start_time: float,
     feature: str,
     *,
     likelihood_min: float = 0.98,
     jitter_sd: float = 3.0,
 ) -> TimedSignal:
-    x = session.pose.select(feature + "_x").to_numpy().ravel()
-    y = session.pose.select(feature + "_y").to_numpy().ravel()
-    likelihood = session.pose.select(feature + "_likelihood").to_numpy().ravel()
-    temporal_norm = session.pose.select(feature + "_temporal_norm").to_numpy().ravel()
+    x = pose.select(feature + "_x").to_numpy().ravel()
+    y = pose.select(feature + "_y").to_numpy().ravel()
+    likelihood = pose.select(feature + "_likelihood").to_numpy().ravel()
+    temporal_norm = pose.select(feature + "_temporal_norm").to_numpy().ravel()
+    if side_frame_times.size != x.size:
+        raise ValueError(
+            f"side camera has {side_frame_times.size} frame times but "
+            f"{feature!r} has {x.size} pose samples"
+        )
     valid = (likelihood > likelihood_min) & (
         temporal_norm
         <= np.nanmean(temporal_norm) + jitter_sd * np.nanstd(temporal_norm)
     )
     return TimedSignal(
         np.sqrt(x[valid] ** 2 + y[valid] ** 2),
-        session.side_frame_times[valid] - session.task_start_time,
+        side_frame_times[valid] - task_start_time,
     )
 
 
-def model_data(session: SessionData) -> ModelData:
-    """Resolve the experiment's NWB schema into named, model-ready inputs."""
-    event_names = (*STIMULUS_EVENTS, *OUTCOME_EVENTS)
-    events = {name: _trial_events(session, name) for name in event_names}
-    events.update(
-        {
-            "licks": session.lick_times - session.task_start_time,
-            "rewards": session.reward_times - session.task_start_time,
-        }
-    )
+def load_session(
+    nwb_path: str,
+    model: ModelSpec,
+    *additional_models: ModelSpec,
+) -> SessionData:
+    """Load the union of session inputs required by the supplied models."""
+    models = (model, *additional_models)
+    if any(not np.isclose(candidate.dt, model.dt) for candidate in additional_models):
+        raise ValueError("models loaded together must use the same dt")
+    event_sources, signal_sources, trial_value_sources = _required_sources(models)
+    _validate_sources(event_sources, signal_sources, trial_value_sources)
 
-    start_relative = session.trial_start_times - session.task_start_time
-    duration = session.task_end_time - session.task_start_time
+    trials = lazynwb.read_nwb(nwb_path, "/intervals/trials")
+    starts = trials.select("start_time").to_numpy().ravel()
+    ends = trials.select("stop_time").to_numpy().ravel()
+    task_start = float(starts[0])
+    task_end = float(ends[-1])
+    n_time = int(np.floor((task_end - task_start) / model.dt))
+
+    start_relative = starts - task_start
+    duration = task_end - task_start
     trial_ends = np.append(start_relative[1:], duration)
-    trial_index = make_trial_index(
-        start_relative, trial_ends, session.dt, n_time=session.n_time
-    )
-    signals = {
-        "running_speed": TimedSignal(
-            session.running_speed[:, 1],
-            session.running_speed[:, 0] - session.task_start_time,
-        ),
-        "pupil_area": TimedSignal(
-            session.pupil[:, 1],
-            session.pupil[:, 0] - session.task_start_time,
-        ),
-        "ear": _pose_signal(session, "ear_base_l"),
-        "jaw": _pose_signal(session, "jaw"),
-        "nose": _pose_signal(session, "nose_tip"),
-        "whisker_pad": _pose_signal(session, "whisker_pad_l_side"),
-        # Additive context baseline: hold each trial's label constant over all
-        # of its bins, with an instantaneous step at the trial boundary.
-        "context_baseline": TimedSignal(session.trial_context[trial_index]),
-        "time": TimedSignal(np.arange(session.n_time) / session.n_time),
+    trial_index = make_trial_index(start_relative, trial_ends, model.dt, n_time=n_time)
+
+    events = {
+        source: _trial_events(trials, task_start, source)
+        for source in sorted(event_sources & _TRIAL_EVENT_SOURCES)
     }
-    return ModelData(
-        dt=session.dt,
+    for source, path in (
+        ("licks", "/processing/behavior/licks"),
+        ("rewards", "/processing/behavior/rewards"),
+    ):
+        if source in event_sources:
+            times = (
+                lazynwb.scan_nwb(nwb_path, path)
+                .select("timestamps")
+                .collect()
+                .to_numpy()
+                .ravel()
+            )
+            events[source] = times - task_start
+
+    signals: dict[str, TimedSignal] = {}
+    if "running_speed" in signal_sources:
+        running = (
+            lazynwb.scan_nwb(nwb_path, "/processing/behavior/running_speed")
+            .select("timestamps", "data")
+            .collect()
+            .to_numpy()
+        )
+        signals["running_speed"] = TimedSignal(
+            running[:, 1], running[:, 0] - task_start
+        )
+    if "pupil_area" in signal_sources:
+        pupil = (
+            lazynwb.scan_nwb(nwb_path, "/processing/behavior/eye_tracking")
+            .filter(~pl.col("pupil_is_bad_frame"))
+            .select("timestamps", "pupil_area")
+            .collect()
+            .to_numpy()
+        )
+        signals["pupil_area"] = TimedSignal(pupil[:, 1], pupil[:, 0] - task_start)
+
+    requested_face_sources = [
+        source for source in _FACE_SIGNAL_FEATURES if source in signal_sources
+    ]
+    if requested_face_sources:
+        pose_columns = [
+            feature + suffix
+            for source in requested_face_sources
+            for feature in (_FACE_SIGNAL_FEATURES[source],)
+            for suffix in ("_x", "_y", "_likelihood", "_temporal_norm")
+        ]
+        pose = (
+            lazynwb.scan_nwb(nwb_path, "/processing/behavior/lp_side_camera")
+            .select(*pose_columns)
+            .collect()
+        )
+        side_frame_times = (
+            lazynwb.scan_nwb(nwb_path, "/acquisition/frametimes_side_camera")
+            .select("timestamps")
+            .collect()
+            .to_numpy()
+            .ravel()
+        )
+        for source in requested_face_sources:
+            signals[source] = _pose_signal(
+                pose,
+                side_frame_times,
+                task_start,
+                _FACE_SIGNAL_FEATURES[source],
+            )
+
+    trial_values = {}
+    if "context_baseline" in signal_sources or "trial_context" in trial_value_sources:
+        trial_context = trials["is_vis_rewarded"].to_numpy().astype(int) * 2 - 1
+        if "context_baseline" in signal_sources:
+            # Hold each trial's label constant over all of its bins, with an
+            # instantaneous step at the trial boundary.
+            signals["context_baseline"] = TimedSignal(trial_context[trial_index])
+        if "trial_context" in trial_value_sources:
+            trial_values["trial_context"] = trial_context
+    if "time" in signal_sources:
+        signals["time"] = TimedSignal(np.arange(n_time) / n_time)
+
+    data = ModelData(
+        dt=model.dt,
         trial_index=trial_index,
         events=events,
         signals=signals,
-        trial_values={"trial_context": session.trial_context},
+        trial_values=trial_values,
+    )
+    return SessionData(
+        nwb_path=nwb_path,
+        task_start_time=task_start,
+        task_end_time=task_end,
+        data=data,
     )
 
 
@@ -450,11 +541,10 @@ def stimulus_mask(
 
 def prepare(
     session: SessionData,
-    model: ModelSpec = DEFAULT_MODEL,
+    model: ModelSpec,
 ) -> PreparedDesign:
     """Build one session-shared design for a declared model."""
-    data = model_data(session)
-    return compile_design(model, data)
+    return compile_design(model, session.data)
 
 
 def qc_unit_ids(nwb_path: str, *, qc_column: str = QC_COLUMN) -> list[str]:
