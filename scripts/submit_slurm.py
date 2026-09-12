@@ -26,7 +26,7 @@ LOG_DIR = REPO_DIR / "logs"
 PARTITION = "braintv"
 CPUS = 8
 MEMORY = "32G"
-WALLTIME = "4:00:00"
+WALLTIME = "24:00:00"
 
 datacube_config.use_cache = True
 
