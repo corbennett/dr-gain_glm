@@ -19,6 +19,11 @@ def main() -> None:
     parser.add_argument("--unit", action="append", dest="units")
     parser.add_argument("--unit-limit", type=int, default=8)
     parser.add_argument("--dropout", action="append", type=parse_dropout)
+    parser.add_argument(
+        "--cv-split",
+        choices=("auto", "groups", "trials"),
+        default="auto",
+    )
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--fold-seed", type=int)
     parser.add_argument(
@@ -45,7 +50,11 @@ def main() -> None:
         unit_limit=args.unit_limit,
         dropouts=args.dropout,
         fit=FitConfig(max_iter=args.max_iter),
-        cv=CVConfig(folds=args.folds, seed=args.fold_seed),
+        cv=CVConfig(
+            folds=args.folds,
+            seed=args.fold_seed,
+            split=args.cv_split,
+        ),
         use_instruction_trials=args.use_instruction_trials,
     )
     print(table)

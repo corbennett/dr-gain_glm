@@ -40,7 +40,8 @@ class ModelData:
 
     Event and signal times are relative to the beginning of this grid. Trial
     indices must be non-negative and index every per-trial value used by the
-    model.
+    model. ``cv_groups`` optionally assigns each trial to an outer-CV group;
+    grouped evaluation leaves out one complete group at a time.
     """
 
     dt: float
@@ -48,6 +49,7 @@ class ModelData:
     events: Mapping[str, np.ndarray] = field(default_factory=dict)
     signals: Mapping[str, TimedSignal | np.ndarray] = field(default_factory=dict)
     trial_values: Mapping[str, np.ndarray] = field(default_factory=dict)
+    cv_groups: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if not np.isfinite(self.dt) or self.dt <= 0:
@@ -57,6 +59,18 @@ class ModelData:
             raise ValueError("trial_index cannot be empty")
         if np.any(trial_index < 0):
             raise ValueError("trial_index must contain only non-negative indices")
+        n_trials = int(trial_index.max()) + 1
+
+        cv_groups = (
+            None if self.cv_groups is None else _readonly(self.cv_groups, dtype=int)
+        )
+        if cv_groups is not None:
+            if cv_groups.size != n_trials:
+                raise ValueError(
+                    "cv_groups must contain one group label per indexed trial"
+                )
+            if np.any(cv_groups < 0):
+                raise ValueError("cv_groups must contain only non-negative labels")
 
         events = {name: _readonly(times) for name, times in self.events.items()}
         signals = {
@@ -70,6 +84,7 @@ class ModelData:
         object.__setattr__(self, "events", events)
         object.__setattr__(self, "signals", signals)
         object.__setattr__(self, "trial_values", trial_values)
+        object.__setattr__(self, "cv_groups", cv_groups)
 
     @property
     def n_time(self) -> int:

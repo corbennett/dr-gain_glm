@@ -159,6 +159,8 @@ def compare_models(
                 "unit_id": unit,
                 "train_r2": result.train_r2,
                 "cv_r2": result.cv.r2,
+                "cv_split": result.cv.split,
+                "n_cv_folds": result.cv.r2_per_fold.size,
                 "worst_fold_r2": float(np.min(result.cv.r2_per_fold)),
                 "n_iter": result.fit.n_iter,
                 "converged": result.fit.converged,
@@ -215,6 +217,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         action="store_true",
         help="Disable the model's declared dropout comparisons",
     )
+    parser.add_argument(
+        "--cv-split",
+        choices=("auto", "groups", "trials"),
+        default="auto",
+        help=(
+            "Outer split: auto uses data groups when present; groups leaves "
+            "out each group; trials uses --folds/--fold-seed"
+        ),
+    )
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--fold-seed", type=int)
     parser.add_argument(
@@ -243,7 +254,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         model=model,
         dropouts=() if args.no_dropouts else args.dropout,
         fit=FitConfig(max_iter=args.max_iter),
-        cv=CVConfig(folds=args.folds, seed=args.fold_seed),
+        cv=CVConfig(
+            folds=args.folds,
+            seed=args.fold_seed,
+            split=args.cv_split,
+        ),
         n_jobs=args.n_jobs,
         limit=args.limit,
         qc_column=args.qc_column,

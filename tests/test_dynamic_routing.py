@@ -13,6 +13,7 @@ from gain_glm.dynamic_routing import (
     NO_HIT_LONG_STIM_MODEL,
     ONLY_BASELINE_MODEL,
     STIMULUS_EVENTS,
+    _context_block_index,
     load_session,
     load_unit_target,
     prepare,
@@ -113,12 +114,19 @@ class DynamicRoutingAdapterTests(unittest.TestCase):
         np.testing.assert_array_equal(data.trial_index[:40], 0)
         np.testing.assert_array_equal(data.trial_index[40:], 1)
         np.testing.assert_array_equal(data.trial_values["trial_context"], [-1, 1])
+        np.testing.assert_array_equal(data.cv_groups, [0, 1])
         self.assertNotIn("is_miss", data.events)
         context_baseline = data.signals["context_baseline"]
         self.assertIsNone(context_baseline.times)
         np.testing.assert_array_equal(context_baseline.values[:40], -1)
         np.testing.assert_array_equal(context_baseline.values[40:], 1)
         self.assertNotIn(999, data.signals["pupil_area"].values)
+
+    def test_context_blocks_are_contiguous_context_runs(self):
+        np.testing.assert_array_equal(
+            _context_block_index([-1, -1, 1, 1, -1, -1, 1]),
+            [0, 0, 1, 1, 2, 2, 3],
+        )
 
     def test_bins_and_stimulus_kernels_are_aligned_to_each_onset(self):
         stimulus_times = np.array([10.212, 11.219])

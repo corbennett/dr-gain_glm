@@ -41,6 +41,8 @@ class BatchTests(unittest.TestCase):
                     "results",
                     "--folds",
                     "7",
+                    "--cv-split",
+                    "trials",
                     "--fold-seed",
                     "13",
                     "--dt",
@@ -52,6 +54,7 @@ class BatchTests(unittest.TestCase):
         options = fit_session.call_args.kwargs
         self.assertEqual(options["cv"].folds, 7)
         self.assertEqual(options["cv"].seed, 13)
+        self.assertEqual(options["cv"].split, "trials")
         self.assertEqual(options["model"].dt, 0.05)
         self.assertTrue(options["use_instruction_trials"])
 

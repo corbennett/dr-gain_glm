@@ -1,4 +1,4 @@
-"""Trial-held-out evaluation and declarative reduced-model comparisons."""
+"""Grouped or trial-held-out evaluation and reduced-model comparisons."""
 
 from __future__ import annotations
 
@@ -27,15 +27,20 @@ from .model import (
 
 @dataclass(frozen=True)
 class CVConfig:
+    """Configure outer CV, preferring available trial-group labels by default."""
+
     folds: int = 5
     seed: int | None = None
     gap_history: bool | int = False
+    split: str = "auto"
 
     def __post_init__(self) -> None:
         if self.folds < 2:
             raise ValueError("CV requires at least two folds")
         if isinstance(self.gap_history, int) and self.gap_history < 0:
             raise ValueError("gap_history cannot be negative")
+        if self.split not in {"auto", "groups", "trials"}:
+            raise ValueError("CV split must be 'auto', 'groups', or 'trials'")
 
 
 @dataclass(frozen=True)
@@ -44,6 +49,8 @@ class CVResult:
     n_iter_per_fold: np.ndarray
     diagnostics_per_fold: tuple[ConvergenceDiagnostics, ...]
     r2_pooled: float = float("nan")
+    split: str = "trials"
+    held_out_groups: np.ndarray | None = None
 
     @property
     def r2(self) -> float:
@@ -137,6 +144,12 @@ class EvaluationResult:
             "cv_r2": self.cv.r2,
             "cv_r2_per_fold": self.cv.r2_per_fold.copy(),
             "cv_r2_pooled": self.cv.r2_pooled,
+            "cv_split": self.cv.split,
+            "cv_held_out_groups": (
+                None
+                if self.cv.held_out_groups is None
+                else self.cv.held_out_groups.copy()
+            ),
             "n_iter": self.fit.n_iter,
             "n_iter_per_fold": self.cv.n_iter_per_fold.copy(),
             # ``converged`` is retained for compatibility and describes only
@@ -193,6 +206,38 @@ def _r2_from_sse(target: np.ndarray, squared_error: float) -> float:
     return 1 - squared_error / total
 
 
+def _outer_folds(
+    prepared: PreparedDesign,
+    selected: np.ndarray,
+    config: CVConfig,
+) -> tuple[list[np.ndarray], str, np.ndarray | None]:
+    """Return test-trial arrays and metadata for the requested outer split."""
+    trials = np.unique(prepared.data.trial_index[selected])
+    use_groups = config.split == "groups" or (
+        config.split == "auto" and prepared.data.cv_groups is not None
+    )
+    if use_groups:
+        if prepared.data.cv_groups is None:
+            raise ValueError("grouped CV requires data.cv_groups")
+        trial_groups = prepared.data.cv_groups[trials]
+        _, first_indices = np.unique(trial_groups, return_index=True)
+        groups = trial_groups[np.sort(first_indices)]
+        if groups.size < 2:
+            raise ValueError(
+                "grouped CV requires at least two groups with selected rows"
+            )
+        folds = [trials[trial_groups == group] for group in groups]
+        return folds, "groups", groups
+
+    if config.folds > trials.size:
+        raise ValueError(
+            f"CV requests {config.folds} folds for only {trials.size} trials"
+        )
+    if config.seed is not None:
+        trials = np.random.default_rng(config.seed).permutation(trials)
+    return list(np.array_split(trials, config.folds)), "trials", None
+
+
 def evaluate(
     prepared: PreparedDesign,
     y: np.ndarray,
@@ -225,15 +270,8 @@ def evaluate(
     blocks = prepared.blocks_for_target(values if prepared.has_history else None)
 
     # A row mask may exclude complete trials (for example instruction trials),
-    # so do not create outer folds from trials with no selected rows.
-    trials = np.unique(prepared.data.trial_index[selected])
-    if cv_config.folds > trials.size:
-        raise ValueError(
-            f"CV requests {cv_config.folds} folds for only {trials.size} trials"
-        )
-    if cv_config.seed is not None:
-        trials = np.random.default_rng(cv_config.seed).permutation(trials)
-    folds = np.array_split(trials, cv_config.folds)
+    # so do not create outer folds from trials or groups with no selected rows.
+    folds, cv_split, held_out_groups = _outer_folds(prepared, selected, cv_config)
 
     history_gap = 0
     if cv_config.gap_history:
@@ -409,6 +447,8 @@ def evaluate(
             r2_pooled=full_r2_pooled,
             n_iter_per_fold=np.asarray(full_iterations, dtype=int),
             diagnostics_per_fold=tuple(full_diagnostics),
+            split=cv_split,
+            held_out_groups=held_out_groups,
         ),
         dropouts=dropout_results,
     )

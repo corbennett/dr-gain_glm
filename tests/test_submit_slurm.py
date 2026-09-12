@@ -40,12 +40,14 @@ class SubmitSlurmTests(unittest.TestCase):
             model="default",
             max_iter=50,
             folds=7,
+            cv_split="trials",
             fold_seed=0,
             dt=0.05,
             use_instruction_trials=True,
         )
 
         self.assertIn("--folds 7", command)
+        self.assertIn("--cv-split trials", command)
         self.assertIn("--fold-seed 0", command)
         self.assertIn("--dt 0.05", command)
         self.assertIn("--use-instruction-trials", command)
@@ -60,7 +62,8 @@ class SubmitSlurmTests(unittest.TestCase):
             folds=5,
         )
 
-        self.assertIn("--folds 5", command)
+        self.assertNotIn("--folds", command)
+        self.assertIn("--cv-split auto", command)
         self.assertNotIn("--fold-seed", command)
         self.assertNotIn("--dt", command)
         self.assertNotIn("--use-instruction-trials", command)

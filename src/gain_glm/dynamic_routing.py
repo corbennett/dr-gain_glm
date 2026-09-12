@@ -24,7 +24,7 @@ from .model import Dropout, Event, Gain, ModelSpec, Signal
 lazynwb.config.anon = True
 
 DEFAULT_DT = 0.025
-STIMULUS_FIT_WINDOW = (-0.5, 1.0)
+STIMULUS_FIT_WINDOW = (-1.0, 1.0)
 QC_COLUMN = "default_qc"
 INSTRUCTION_TRIAL_COLUMN = "is_instruction"
 STIMULUS_EVENTS = (
@@ -163,16 +163,16 @@ DEFAULT_DROPOUTS = (
         *LATE_STIMULUS_PREDICTOR_NAMES,
         name="late_stim_context_gain",
     ),
-    Dropout.gain_terms(
-        "context",
-        "rewards",
-        name="reward_context_gain",
-    ),
-    Dropout.gain_terms(
-        "context",
-        "licks",
-        name="lick_context_gain",
-    ),
+    # Dropout.gain_terms(
+    #     "context",
+    #     "rewards",
+    #     name="reward_context_gain",
+    # ),
+    # Dropout.gain_terms(
+    #     "context",
+    #     "licks",
+    #     name="lick_context_gain",
+    # ),
     Dropout.predictors("context_baseline"),
 )
 
@@ -431,6 +431,16 @@ def _filter_events_to_included_trials(
     return values[keep]
 
 
+def _context_block_index(context: np.ndarray) -> np.ndarray:
+    """Number contiguous runs of one rewarded context in trial order."""
+    values = np.asarray(context).ravel()
+    if values.size == 0:
+        raise ValueError("cannot identify context blocks without trials")
+    blocks = np.zeros(values.size, dtype=int)
+    blocks[1:] = np.cumsum(values[1:] != values[:-1])
+    return blocks
+
+
 def _pose_signal(
     pose: pl.DataFrame,
     side_frame_times: np.ndarray,
@@ -660,8 +670,8 @@ def load_session(
             )
 
     trial_values = {}
+    trial_context = trials["is_vis_rewarded"].to_numpy().astype(int) * 2 - 1
     if "context_baseline" in signal_sources or "trial_context" in trial_value_sources:
-        trial_context = trials["is_vis_rewarded"].to_numpy().astype(int) * 2 - 1
         if "context_baseline" in signal_sources:
             # Hold each trial's label constant over all of its bins, with an
             # instantaneous step at the trial boundary.
@@ -679,6 +689,7 @@ def load_session(
         events=events,
         signals=signals,
         trial_values=trial_values,
+        cv_groups=_context_block_index(trial_context),
     )
     return SessionData(
         nwb_path=nwb_path,

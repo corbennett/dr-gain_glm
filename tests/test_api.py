@@ -62,6 +62,22 @@ def synthetic_problem(seed=0):
 
 
 class SpecificationTests(unittest.TestCase):
+    def test_cv_groups_are_validated_and_read_only(self):
+        data = ModelData(
+            dt=0.1,
+            trial_index=np.repeat(np.arange(3), 2),
+            cv_groups=[0, 0, 1],
+        )
+
+        np.testing.assert_array_equal(data.cv_groups, [0, 0, 1])
+        self.assertFalse(data.cv_groups.flags.writeable)
+        with self.assertRaisesRegex(ValueError, "one group label per indexed trial"):
+            ModelData(
+                dt=0.1,
+                trial_index=np.repeat(np.arange(3), 2),
+                cv_groups=[0, 1],
+            )
+
     def test_model_variants_are_immutable(self):
         prepared, _ = synthetic_problem()
         original = prepared.spec
@@ -369,6 +385,70 @@ class EvaluationTests(unittest.TestCase):
                 )
             )
             self.assertGreater(validation_rows.size, 0)
+
+    def test_outer_cv_leaves_out_each_group_when_groups_are_available(self):
+        rng = np.random.default_rng(31)
+        n_trials = 12
+        trial_index = np.repeat(np.arange(n_trials), 5)
+        groups = np.repeat(np.arange(6), 2)
+        x = rng.normal(size=trial_index.size)
+        data = ModelData(
+            dt=0.1,
+            trial_index=trial_index,
+            signals={"x": x},
+            cv_groups=groups,
+        )
+        prepared = compile_design(
+            ModelSpec((Signal("x", window=(0, 0), n_basis=1),), dt=0.1),
+            data,
+        )
+
+        result = prepared.evaluate(
+            0.5 + x,
+            fit=FitConfig(kernel_alpha=1e-6, max_iter=1),
+            cv=CVConfig(folds=3, seed=4),
+        )
+
+        self.assertEqual(result.cv.split, "groups")
+        np.testing.assert_array_equal(result.cv.held_out_groups, np.arange(6))
+        self.assertEqual(result.cv.r2_per_fold.shape, (6,))
+        summary = result.to_dict()
+        self.assertEqual(summary["cv_split"], "groups")
+        np.testing.assert_array_equal(summary["cv_held_out_groups"], np.arange(6))
+
+    def test_outer_cv_can_explicitly_use_trial_folds_with_grouped_data(self):
+        rng = np.random.default_rng(32)
+        n_trials = 12
+        trial_index = np.repeat(np.arange(n_trials), 5)
+        x = rng.normal(size=trial_index.size)
+        data = ModelData(
+            dt=0.1,
+            trial_index=trial_index,
+            signals={"x": x},
+            cv_groups=np.repeat(np.arange(6), 2),
+        )
+        prepared = compile_design(
+            ModelSpec((Signal("x", window=(0, 0), n_basis=1),), dt=0.1),
+            data,
+        )
+
+        result = prepared.evaluate(
+            0.5 + x,
+            fit=FitConfig(kernel_alpha=1e-6, max_iter=1),
+            cv=CVConfig(folds=3, seed=4, split="trials"),
+        )
+
+        self.assertEqual(result.cv.split, "trials")
+        self.assertIsNone(result.cv.held_out_groups)
+        self.assertEqual(result.cv.r2_per_fold.shape, (3,))
+
+    def test_grouped_outer_cv_requires_group_labels(self):
+        with self.assertRaisesRegex(ValueError, "requires data.cv_groups"):
+            self.prepared.evaluate(
+                self.y,
+                fit=self.fit,
+                cv=CVConfig(split="groups"),
+            )
 
     def test_multiple_dropouts_share_full_fold_fits(self):
         from gain_glm import evaluation

@@ -19,8 +19,8 @@ The package separates four things that used to be mixed together:
    and default reduced-model comparisons.
 2. `ModelData` supplies named arrays on one time grid.
 3. `PreparedDesign` caches session-shared convolutional design matrices.
-4. `EvaluationResult` contains one fit, trial-held-out CV, and any requested
-   reduced-model comparisons.
+4. `EvaluationResult` contains one fit, grouped or trial-held-out CV, and any
+   requested reduced-model comparisons.
 
 Model specifications and prepared designs are immutable. Fitting one unit does
 not modify anything reused by another unit.
@@ -107,6 +107,7 @@ data = ModelData(
     trial_values={
         "context": context,       # one value per trial
     },
+    cv_groups=block_index,         # optional: one outer-CV group per trial
 )
 
 prepared = compile_design(model, data)
@@ -138,7 +139,7 @@ result = prepared.evaluate(
         regularizer="ridge",
         max_iter=100,
     ),
-    cv=CVConfig(folds=5, seed=0),
+    cv=CVConfig(),
 )
 
 print(result.train_r2)
@@ -257,8 +258,8 @@ parameter. When a value is `None`, the fitter searches `FitConfig.alphas`
 corresponding ALS update and then holds the selected value fixed.
 
 `FitConfig.inner_cv_folds` controls the number of folds used by the
-scikit-learn alpha selector. It is separate from the trial-held-out outer CV
-configured by `CVConfig`. Inner folds are trial-aware: all time bins from a
+scikit-learn alpha selector. It is separate from the outer CV configured by
+`CVConfig`. Inner folds are trial-aware: all time bins from a
 trial are assigned to the same inner training or validation fold. With
 `inner_cv_folds=None`, five trial folds are used; an integer such as `5`
 changes the number of trial folds. At least that many training trials must be
@@ -269,13 +270,21 @@ The outer model evaluation also keeps complete trials together. The two levels
 therefore differ in purpose, but neither level splits the bins of one trial
 across training and validation.
 
-#### Full fit and trial-held-out evaluation
+#### Full fit and outer-CV evaluation
 
 `evaluate()` first fits one model to all selected rows and reports its training
-R². It then obtains the unique trial IDs, optionally permutes them using
-`CVConfig.seed`, and divides the trial IDs into `CVConfig.folds` groups. Every
-time bin from a trial belongs to the same outer training or test set. These
-outer folds are trial-aware but are not stratified by trial condition.
+R². With the default `CVConfig(split="auto")`, data that supply per-trial
+`ModelData.cv_groups` use leave-one-group-out CV. Every selected trial in one
+group is held out together. `CVConfig(split="groups")` requires those labels,
+while `CVConfig(split="trials")` explicitly selects the original trial K-fold
+behavior: unique trial IDs are optionally permuted using `CVConfig.seed` and
+divided into `CVConfig.folds` groups. No mode splits the bins of one trial
+between training and test sets.
+
+Grouped results report `CVResult.split == "groups"` and identify the group held
+out by each fold in `CVResult.held_out_groups`. Serialized summaries expose the
+same metadata as `cv_split` and `cv_held_out_groups`. `CVConfig.folds` and
+`CVConfig.seed` apply only to trial K-fold CV.
 
 Each outer training fold runs a new ALS fit and therefore selects its own
 regularization strengths when they were not explicitly supplied. R² is
@@ -362,7 +371,7 @@ prepared = prepare(session, DEFAULT_MODEL)
 
 result = prepared.evaluate(
     y,
-    cv=CVConfig(folds=5, seed=0),
+    cv=CVConfig(),
 )
 ```
 
@@ -376,7 +385,11 @@ less than one bin at the beginning or end of a trial is discarded. Spike
 targets and continuous signals are sampled on those aligned bins, and temporal
 convolutions are reset at trial boundaries so no lagged value crosses between
 concatenated trials. `SessionData.bin_starts` records the absolute start time of
-every retained row.
+every retained row. The adapter also identifies context blocks as contiguous
+runs of `is_vis_rewarded` and stores their indices in `ModelData.cv_groups`.
+Consequently, the default outer evaluation leaves out each complete context
+block—normally six folds. Use `CVConfig(split="trials", folds=5, seed=0)` only
+when a trial-level comparison is specifically desired.
 
 Available full-model declarations are exposed through `MODELS`:
 
@@ -401,17 +414,18 @@ gain-glm-fit \
   --session-id 668755_2023-08-31 \
   --output-dir results \
   --model default \
-  --dt 0.025 \
-  --folds 5 \
-  --fold-seed 0
+  --dt 0.025
 ```
 
 Omitting `--dropout` uses the selected model's declared comparisons. Providing
 one or more `--dropout` arguments replaces them for that run; `--no-dropouts`
 disables them. Omitting `--dt` uses the selected model's declared time-bin
-width. Omitting `--fold-seed` leaves trials in trial-ID order, while supplying
-an integer reproducibly randomizes whole trials among folds. Instruction trials
-are excluded by default; add `--use-instruction-trials` to include them.
+width. The default `--cv-split auto` uses the context-block groups supplied by
+the Dynamic Routing adapter. Set `--cv-split trials` to use `--folds` trial
+folds; in that mode, omitting `--fold-seed` leaves trials in trial-ID order,
+while supplying an integer reproducibly randomizes whole trials among folds.
+Instruction trials are excluded by default; add `--use-instruction-trials` to
+include them.
 
 Model comparison and SLURM launchers are in `scripts/` and take model names as
 arguments instead of requiring source edits. The SLURM launcher forwards the
@@ -421,8 +435,6 @@ same time-grid and outer-CV options to every session job:
 python scripts/submit_slurm.py \
   --model default \
   --dt 0.025 \
-  --folds 5 \
-  --fold-seed 0 \
   --dry-run
 ```
 

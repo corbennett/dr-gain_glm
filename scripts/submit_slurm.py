@@ -85,7 +85,8 @@ def fit_command(
     *,
     model: str,
     max_iter: int,
-    folds: int,
+    folds: int = 5,
+    cv_split: str = "auto",
     fold_seed: int | None = None,
     dt: float | None = None,
     unit_limit: int | None = None,
@@ -99,10 +100,12 @@ def fit_command(
         f"{PYTHON} -m gain_glm.batch "
         f"--nwb-path {nwb_path} --session-id {session_id} "
         f"--output-dir {output_dir} --model {model} "
-        f"--max-iter {max_iter} --folds {folds}"
+        f"--max-iter {max_iter} --cv-split {cv_split}"
     )
-    if fold_seed is not None:
-        command += f" --fold-seed {fold_seed}"
+    if cv_split == "trials":
+        command += f" --folds {folds}"
+        if fold_seed is not None:
+            command += f" --fold-seed {fold_seed}"
     if dt is not None:
         command += f" --dt {dt}"
     if unit_limit is not None:
@@ -140,6 +143,11 @@ def main() -> None:
     parser.add_argument("--limit", type=int)
     parser.add_argument("--unit-limit", type=int)
     parser.add_argument("--model", choices=MODELS, default="default")
+    parser.add_argument(
+        "--cv-split",
+        choices=("auto", "groups", "trials"),
+        default="auto",
+    )
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--fold-seed", type=int)
     parser.add_argument(
@@ -180,6 +188,7 @@ def main() -> None:
             model=args.model,
             max_iter=args.max_iter,
             folds=args.folds,
+            cv_split=args.cv_split,
             fold_seed=args.fold_seed,
             dt=args.dt,
             unit_limit=args.unit_limit,
