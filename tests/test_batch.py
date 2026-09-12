@@ -45,6 +45,7 @@ class BatchTests(unittest.TestCase):
                     "13",
                     "--dt",
                     "0.05",
+                    "--use-instruction-trials",
                 ]
             )
 
@@ -52,6 +53,7 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(options["cv"].folds, 7)
         self.assertEqual(options["cv"].seed, 13)
         self.assertEqual(options["model"].dt, 0.05)
+        self.assertTrue(options["use_instruction_trials"])
 
     def test_prepared_design_is_process_serializable(self):
         trial_index = np.repeat(np.arange(3), 4)

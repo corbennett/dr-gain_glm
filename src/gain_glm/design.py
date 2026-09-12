@@ -333,8 +333,14 @@ def compile_design(
     data: ModelData,
     *,
     fit_mask: np.ndarray | None = None,
+    row_mask: np.ndarray | None = None,
 ) -> PreparedDesign:
-    """Resolve all named inputs and precompute target-independent convolutions."""
+    """Resolve all named inputs and precompute target-independent convolutions.
+
+    ``row_mask`` can be used to exclude complete classes of rows (for example,
+    instruction trials) while retaining the model's event-anchored fit window.
+    It is intersected with the resolved fit mask.
+    """
     if not np.isclose(spec.dt, data.dt):
         raise ValueError(
             f"model dt {spec.dt} does not match data dt {data.dt}"
@@ -361,11 +367,21 @@ def compile_design(
             if not mask.any():
                 raise ValueError("model fit window selects no bins")
     else:
-        mask = np.asarray(fit_mask, dtype=bool).ravel()
+        mask = np.asarray(fit_mask, dtype=bool).ravel().copy()
         if mask.size != data.n_time:
             raise ValueError(f"fit_mask has length {mask.size}, expected {data.n_time}")
         if not mask.any():
             raise ValueError("fit_mask selects no bins")
+
+    if row_mask is not None:
+        included = np.asarray(row_mask, dtype=bool).ravel()
+        if included.size != data.n_time:
+            raise ValueError(
+                f"row_mask has length {included.size}, expected {data.n_time}"
+            )
+        mask &= included
+        if not mask.any():
+            raise ValueError("row_mask removes all selected fit bins")
 
     signal_series: dict[str, np.ndarray] = {}
     for predictor in spec.predictors:

@@ -89,6 +89,7 @@ def fit_command(
     fold_seed: int | None = None,
     dt: float | None = None,
     unit_limit: int | None = None,
+    use_instruction_trials: bool = False,
     overwrite: bool = False,
 ) -> str:
     """Build the batch-fitting command run inside one SLURM job."""
@@ -106,6 +107,8 @@ def fit_command(
         command += f" --dt {dt}"
     if unit_limit is not None:
         command += f" --limit {unit_limit}"
+    if use_instruction_trials:
+        command += " --use-instruction-trials"
     if overwrite:
         command += " --overwrite"
     return command
@@ -145,6 +148,11 @@ def main() -> None:
         help="Override the selected model's time-bin width in seconds",
     )
     parser.add_argument("--max-iter", type=int, default=FitConfig().max_iter)
+    parser.add_argument(
+        "--use-instruction-trials",
+        action="store_true",
+        help="Include instruction trials (default: exclude them)",
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument(
         "--output-dir",
@@ -175,6 +183,7 @@ def main() -> None:
             fold_seed=args.fold_seed,
             dt=args.dt,
             unit_limit=args.unit_limit,
+            use_instruction_trials=args.use_instruction_trials,
             overwrite=args.overwrite,
         )
         job = slurm_job(row["session_id"])

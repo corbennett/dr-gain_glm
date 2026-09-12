@@ -188,6 +188,11 @@ only when fitting and scoring. Consequently:
 Passing `mask=` directly to `fit()` or `evaluate()` replaces the prepared
 `fit_mask`; the two masks are not automatically intersected.
 
+`compile_design(..., row_mask=...)` provides an additional row-level filter
+that is intersected with the model's fit mask. The Dynamic Routing adapter uses
+this to exclude instruction-trial rows while retaining the shared session time
+grid.
+
 For predictor $p$, let
 
 $$
@@ -251,22 +256,18 @@ parameter. When a value is `None`, the fitter searches `FitConfig.alphas`
 (25 values from $10^{-3}$ through $10^3$ by default) during the first
 corresponding ALS update and then holds the selected value fixed.
 
-`FitConfig.inner_cv_folds` is passed to the scikit-learn alpha selector. It is
-separate from the trial-held-out outer CV configured by `CVConfig`:
+`FitConfig.inner_cv_folds` controls the number of folds used by the
+scikit-learn alpha selector. It is separate from the trial-held-out outer CV
+configured by `CVConfig`. Inner folds are trial-aware: all time bins from a
+trial are assigned to the same inner training or validation fold. With
+`inner_cv_folds=None`, five trial folds are used; an integer such as `5`
+changes the number of trial folds. At least that many training trials must be
+available. Automatic Ridge alpha selection uses validation mean squared error;
+Lasso uses its usual validation mean squared error as well.
 
-- With Ridge and `inner_cv_folds=None`, `RidgeCV` uses its efficient
-  leave-one-observation-out procedure. With scikit-learn's default scoring,
-  alpha is selected by negative mean squared error.
-- With Ridge and an integer such as `inner_cv_folds=5`, `RidgeCV` uses ordinary
-  row-based K-fold splits. Because the code does not set `scoring`,
-  scikit-learn uses R² in this case.
-- With Lasso and `inner_cv_folds=None`, `LassoCV` uses its default five
-  row-based folds and selects alpha by validation mean squared error. An
-  integer changes the number of row-based folds.
-
-Inner alpha selection is therefore not currently trial-aware: bins from one
-trial may contribute to both its training and validation rows. The outer model
-evaluation described next does keep complete trials together.
+The outer model evaluation also keeps complete trials together. The two levels
+therefore differ in purpose, but neither level splits the bins of one trial
+across training and validation.
 
 #### Full fit and trial-held-out evaluation
 
@@ -293,8 +294,8 @@ The automatic refitting rule is based on what is removed:
 - Gain-only dropout: retain the full model's fold-specific kernels and
   intercept, then independently refit the reduced gain coefficients. This asks
   for the incremental gain contribution conditional on the learned response
-  shapes. If `gain_alpha=None`, each reduced gain model selects its own Ridge
-  alpha from that fold's training rows.
+  shapes. The reduced gain fit reuses the full model fold's selected Ridge
+  alpha, including when `gain_alpha=None` was selected automatically.
 - Predictor-specific gain dropout: `Dropout.gain_terms()` removes one gain's
   coefficients only from the selected predictors, then performs the same
   fixed-kernel gain refit. Gain offsets and every unselected gain coefficient
@@ -380,8 +381,9 @@ Available full-model declarations are exposed through `MODELS`:
 The Dynamic Routing `default` model represents each stimulus with separate
 early (0–0.1 s) and late (0.1–1 s) kernels, both modulated by context. Its
 default dropouts compare the context gain on all early stimulus kernels and on
-all late stimulus kernels separately, in addition to the whole-context-gain and
-context-baseline comparisons.
+all late stimulus kernels separately, as well as on reward and lick predictors;
+they also include the context-baseline comparison. The whole-context-gain
+dropout is not included in the current defaults.
 
 Fit a complete session from the command line:
 
@@ -400,7 +402,8 @@ Omitting `--dropout` uses the selected model's declared comparisons. Providing
 one or more `--dropout` arguments replaces them for that run; `--no-dropouts`
 disables them. Omitting `--dt` uses the selected model's declared time-bin
 width. Omitting `--fold-seed` leaves trials in trial-ID order, while supplying
-an integer reproducibly randomizes whole trials among folds.
+an integer reproducibly randomizes whole trials among folds. Instruction trials
+are excluded by default; add `--use-instruction-trials` to include them.
 
 Model comparison and SLURM launchers are in `scripts/` and take model names as
 arguments instead of requiring source edits. The SLURM launcher forwards the

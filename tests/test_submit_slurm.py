@@ -42,11 +42,13 @@ class SubmitSlurmTests(unittest.TestCase):
             folds=7,
             fold_seed=0,
             dt=0.05,
+            use_instruction_trials=True,
         )
 
         self.assertIn("--folds 7", command)
         self.assertIn("--fold-seed 0", command)
         self.assertIn("--dt 0.05", command)
+        self.assertIn("--use-instruction-trials", command)
 
     def test_fit_command_omits_optional_cv_seed_and_dt(self):
         command = fit_command(
@@ -61,6 +63,7 @@ class SubmitSlurmTests(unittest.TestCase):
         self.assertIn("--folds 5", command)
         self.assertNotIn("--fold-seed", command)
         self.assertNotIn("--dt", command)
+        self.assertNotIn("--use-instruction-trials", command)
 
     def test_run_params_record_overridden_dt_and_cv_options(self):
         args = argparse.Namespace(

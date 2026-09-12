@@ -19,11 +19,18 @@ from gain_glm.dynamic_routing import (
 
 
 class DynamicRoutingAdapterTests(unittest.TestCase):
-    def load_fake_session(self, *models):
+    def load_fake_session(
+        self,
+        *models,
+        instruction=None,
+        use_instruction_trials=False,
+    ):
+        instruction = [False, False] if instruction is None else instruction
         trial_rows = {
             "start_time": [10.0, 11.0],
             "stop_time": [11.0, 12.0],
             "stim_start_time": [10.2, 11.2],
+            "is_instruction": instruction,
             "is_vis_rewarded": [False, True],
             "is_aud_target": [True, False],
             "is_aud_nontarget": [False, False],
@@ -85,7 +92,11 @@ class DynamicRoutingAdapterTests(unittest.TestCase):
                 side_effect=scan_nwb,
             ),
         ):
-            session = load_session("fake.nwb", *models)
+            session = load_session(
+                "fake.nwb",
+                *models,
+                use_instruction_trials=use_instruction_trials,
+            )
         return session, scanned_paths
 
     def make_session(self):
@@ -105,6 +116,32 @@ class DynamicRoutingAdapterTests(unittest.TestCase):
         np.testing.assert_array_equal(context_baseline.values[:40], -1)
         np.testing.assert_array_equal(context_baseline.values[40:], 1)
         self.assertNotIn(999, data.signals["pupil_area"].values)
+
+    def test_instruction_trials_are_excluded_by_default(self):
+        session, _ = self.load_fake_session(
+            DEFAULT_MODEL,
+            instruction=[False, True],
+        )
+
+        self.assertEqual(session.included_trial_mask.tolist(), [True, False])
+        np.testing.assert_allclose(session.data.events["is_aud_target"], [0.2])
+        self.assertEqual(session.data.events["is_vis_target"].size, 0)
+
+        prepared = prepare(session, DEFAULT_MODEL)
+        self.assertTrue(prepared.fit_mask[:40].any())
+        self.assertFalse(prepared.fit_mask[40:].any())
+
+    def test_instruction_trials_can_be_included(self):
+        session, _ = self.load_fake_session(
+            DEFAULT_MODEL,
+            instruction=[False, True],
+            use_instruction_trials=True,
+        )
+        self.assertEqual(session.included_trial_mask.tolist(), [True, True])
+        np.testing.assert_allclose(
+            session.data.events["is_vis_target"], [1.2]
+        )
+        self.assertTrue(prepare(session, DEFAULT_MODEL).fit_mask[40:].any())
 
     def test_no_face_model_does_not_load_or_process_pose(self):
         session, scanned_paths = self.load_fake_session(NO_FACE_MODEL)
@@ -166,7 +203,7 @@ class DynamicRoutingAdapterTests(unittest.TestCase):
     def test_default_model_prepares_without_builder_functions(self):
         prepared = prepare(self.make_session(), DEFAULT_MODEL)
         self.assertEqual(set(prepared.base_blocks), set(DEFAULT_MODEL.predictor_names))
-        self.assertEqual(prepared.base_blocks["is_hit"].shape, (80, 9))
+        self.assertEqual(prepared.base_blocks["rewards"].shape, (80, 12))
         for source, name in zip(STIMULUS_EVENTS, LATE_STIMULUS_PREDICTOR_NAMES):
             predictor = DEFAULT_MODEL.predictor(name)
             self.assertEqual(predictor.source, source)

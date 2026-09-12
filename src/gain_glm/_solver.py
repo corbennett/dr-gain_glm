@@ -10,6 +10,7 @@ from collections.abc import Mapping, Sequence
 
 import numpy as np
 from sklearn.linear_model import Lasso, LassoCV, Ridge, RidgeCV
+from sklearn.model_selection import GroupKFold, PredefinedSplit
 
 from .design import PreparedDesign
 from .model import FitConfig, FitState, FittedModel, Iteration
@@ -20,6 +21,33 @@ def r2_score(y: np.ndarray, prediction: np.ndarray) -> float:
     if total <= 0:
         return float("nan")
     return 1 - float(np.sum((y - prediction) ** 2)) / total
+
+
+def _trial_cv(
+    trial_index: np.ndarray,
+    requested_folds: int | None,
+) -> PredefinedSplit:
+    """Build a deterministic inner-CV splitter with whole trials as groups."""
+    groups = np.asarray(trial_index).ravel()
+    if groups.size == 0:
+        raise ValueError("trial-aware inner CV requires at least one row")
+    unique_trials = np.unique(groups)
+    n_splits = 5 if requested_folds is None else int(requested_folds)
+    if n_splits < 2:
+        raise ValueError("inner_cv_folds must be at least two")
+    if n_splits > unique_trials.size:
+        raise ValueError(
+            f"inner CV requests {n_splits} folds for only "
+            f"{unique_trials.size} training trials"
+        )
+
+    test_fold = np.full(groups.size, -1, dtype=int)
+    splitter = GroupKFold(n_splits=n_splits)
+    for fold, (_, validation_rows) in enumerate(
+        splitter.split(np.zeros(groups.size), groups=groups)
+    ):
+        test_fold[validation_rows] = fold
+    return PredefinedSplit(test_fold)
 
 
 def _initial_gain(prepared: PreparedDesign) -> np.ndarray:
@@ -138,6 +166,7 @@ def _fit_gain_coefficients(
     design: np.ndarray | None,
     target: np.ndarray,
     *,
+    trial_index: np.ndarray,
     keep: np.ndarray | None = None,
     alpha: float | None = None,
 ) -> tuple[np.ndarray, float | None]:
@@ -158,8 +187,9 @@ def _fit_gain_coefficients(
     if alpha is None:
         solver = RidgeCV(
             alphas=np.asarray(config.alphas),
-            cv=config.inner_cv_folds,
+            cv=_trial_cv(trial_index, config.inner_cv_folds),
             fit_intercept=False,
+            scoring="neg_mean_squared_error",
         )
         solver.fit(x, target)
         selected = float(solver.alpha_)
@@ -180,6 +210,7 @@ def refit_gains(
     intercept: float,
     config: FitConfig,
     *,
+    trial_index: np.ndarray,
     keep: np.ndarray | None = None,
     alpha: float | None = None,
 ) -> tuple[np.ndarray, float | None]:
@@ -194,6 +225,7 @@ def refit_gains(
         config,
         _gain_design(prepared, drives, gain_by_time),
         y - offset,
+        trial_index=trial_index,
         keep=keep,
         alpha=config.gain_alpha if alpha is None else alpha,
     )
@@ -244,9 +276,15 @@ def fit_state(
     gain_by_time: Mapping[str, np.ndarray],
     config: FitConfig,
     *,
+    trial_index: np.ndarray,
     keep_gains: np.ndarray | None = None,
 ) -> FitState:
     """Run ALS on arrays already restricted to the desired training rows."""
+    trial_ids = np.asarray(trial_index).ravel()
+    if trial_ids.size != y.size:
+        raise ValueError(
+            f"trial_index has length {trial_ids.size}, expected {y.size}"
+        )
     gain = _initial_gain(prepared)
     beta = np.zeros(prepared.layout.beta_size)
     intercept = 0.0
@@ -279,7 +317,7 @@ def fit_state(
             if kernel_alpha is None:
                 solver = LassoCV(
                     alphas=np.asarray(config.alphas),
-                    cv=config.inner_cv_folds,
+                    cv=_trial_cv(trial_ids, config.inner_cv_folds),
                     fit_intercept=True,
                     max_iter=10_000,
                 )
@@ -304,8 +342,9 @@ def fit_state(
             if kernel_alpha is None:
                 solver = RidgeCV(
                     alphas=np.asarray(config.alphas),
-                    cv=config.inner_cv_folds,
+                    cv=_trial_cv(trial_ids, config.inner_cv_folds),
                     fit_intercept=True,
+                    scoring="neg_mean_squared_error",
                 )
                 solver.fit(x, y)
                 kernel_alpha = float(solver.alpha_)
@@ -332,6 +371,7 @@ def fit_state(
             config,
             _gain_design(prepared, drives, gain_by_time),
             y - offset,
+            trial_index=trial_ids,
             keep=retained,
             alpha=gain_alpha,
         )
@@ -402,6 +442,7 @@ def fit_state(
         beta,
         intercept,
         config,
+        trial_index=trial_ids,
         keep=retained,
         alpha=gain_alpha,
     )
@@ -458,5 +499,6 @@ def fit_model(
         {name: block[used] for name, block in blocks.items()},
         {name: gain[used] for name, gain in prepared.gain_by_time.items()},
         settings,
+        trial_index=prepared.data.trial_index[used],
     )
     return FittedModel(prepared, state, settings, used.copy())

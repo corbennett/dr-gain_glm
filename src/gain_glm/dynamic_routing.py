@@ -28,6 +28,7 @@ lazynwb.config.anon = True
 DEFAULT_DT = 0.025
 STIMULUS_FIT_WINDOW = (-0.5, 1.0)
 QC_COLUMN = "default_qc"
+INSTRUCTION_TRIAL_COLUMN = "is_instruction"
 STIMULUS_EVENTS = (
     "is_aud_target",
     "is_aud_nontarget",
@@ -312,6 +313,18 @@ class SessionData:
     task_start_time: float
     task_end_time: float
     data: ModelData
+    included_trial_mask: np.ndarray
+
+    def __post_init__(self) -> None:
+        included = np.asarray(self.included_trial_mask, dtype=bool).ravel().copy()
+        if included.size != self.data.n_trials:
+            raise ValueError(
+                "included_trial_mask must have one value per indexed trial"
+            )
+        if not included.any():
+            raise ValueError("included_trial_mask must include at least one trial")
+        included.setflags(write=False)
+        object.__setattr__(self, "included_trial_mask", included)
 
     @property
     def dt(self) -> float:
@@ -393,6 +406,22 @@ def _trial_events(
     )
 
 
+def _filter_events_to_included_trials(
+    times: np.ndarray,
+    starts: np.ndarray,
+    ends: np.ndarray,
+    included_trials: np.ndarray,
+) -> np.ndarray:
+    """Remove global events occurring during excluded trial intervals."""
+    values = np.asarray(times, dtype=float).ravel()
+    trial_index = np.searchsorted(starts, values, side="right") - 1
+    in_trial = (trial_index >= 0) & (trial_index < included_trials.size)
+    valid_index = np.flatnonzero(in_trial)
+    keep = np.ones(values.size, dtype=bool)
+    keep[valid_index] = included_trials[trial_index[valid_index]]
+    return values[keep]
+
+
 def _pose_signal(
     pose: pl.DataFrame,
     side_frame_times: np.ndarray,
@@ -425,6 +454,7 @@ def load_session(
     nwb_path: str,
     model: ModelSpec,
     *additional_models: ModelSpec,
+    use_instruction_trials: bool = False,
 ) -> SessionData:
     """Load the union of session inputs required by the supplied models."""
     models = (model, *additional_models)
@@ -434,6 +464,20 @@ def load_session(
     _validate_sources(event_sources, signal_sources, trial_value_sources)
 
     trials = lazynwb.read_nwb(nwb_path, "/intervals/trials")
+    if INSTRUCTION_TRIAL_COLUMN not in trials.columns:
+        raise KeyError(
+            f"trial table is missing required column {INSTRUCTION_TRIAL_COLUMN!r}"
+        )
+    instruction_trials = (
+        trials[INSTRUCTION_TRIAL_COLUMN].fill_null(False).to_numpy().astype(bool)
+    )
+    included_trial_mask = (
+        np.ones(instruction_trials.size, dtype=bool)
+        if use_instruction_trials
+        else ~instruction_trials
+    )
+    if not included_trial_mask.any():
+        raise ValueError("no non-instruction trials are available")
     starts = trials.select("start_time").to_numpy().ravel()
     ends = trials.select("stop_time").to_numpy().ravel()
     task_start = float(starts[0])
@@ -444,9 +488,10 @@ def load_session(
     duration = task_end - task_start
     trial_ends = np.append(start_relative[1:], duration)
     trial_index = make_trial_index(start_relative, trial_ends, model.dt, n_time=n_time)
+    event_trials = trials.filter(pl.Series("included", included_trial_mask))
 
     events = {
-        source: _trial_events(trials, task_start, source)
+        source: _trial_events(event_trials, task_start, source)
         for source in sorted(event_sources & _TRIAL_EVENT_SOURCES)
     }
     for source, path in (
@@ -461,7 +506,12 @@ def load_session(
                 .to_numpy()
                 .ravel()
             )
-            events[source] = times - task_start
+            events[source] = _filter_events_to_included_trials(
+                times - task_start,
+                start_relative,
+                trial_ends,
+                included_trial_mask,
+            )
 
     signals: dict[str, TimedSignal] = {}
     if "running_speed" in signal_sources:
@@ -538,6 +588,7 @@ def load_session(
         task_start_time=task_start,
         task_end_time=task_end,
         data=data,
+        included_trial_mask=included_trial_mask,
     )
 
 
@@ -554,7 +605,8 @@ def prepare(
     model: ModelSpec,
 ) -> PreparedDesign:
     """Build one session-shared design for a declared model."""
-    return compile_design(model, session.data)
+    included_rows = session.included_trial_mask[session.data.trial_index]
+    return compile_design(model, session.data, row_mask=included_rows)
 
 
 def qc_unit_ids(nwb_path: str, *, qc_column: str = QC_COLUMN) -> list[str]:

@@ -355,6 +355,21 @@ class EvaluationTests(unittest.TestCase):
         self.assertIsNotNone(selected)
         self.assertEqual(fitted.state.iterations[-1].gain_alpha, selected)
 
+    def test_inner_cv_keeps_all_bins_from_a_trial_together(self):
+        from gain_glm._solver import _trial_cv
+
+        trial_index = np.repeat(np.arange(8), 5)
+        splitter = _trial_cv(trial_index, requested_folds=4)
+        for train_rows, validation_rows in splitter.split(
+            np.zeros(trial_index.size)
+        ):
+            self.assertTrue(
+                set(trial_index[train_rows]).isdisjoint(
+                    trial_index[validation_rows]
+                )
+            )
+            self.assertGreater(validation_rows.size, 0)
+
     def test_multiple_dropouts_share_full_fold_fits(self):
         from gain_glm import evaluation
 

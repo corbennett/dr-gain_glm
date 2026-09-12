@@ -224,7 +224,9 @@ def evaluate(
     train_r2 = fitted.score(values, selected)
     blocks = prepared.blocks_for_target(values if prepared.has_history else None)
 
-    trials = np.unique(prepared.data.trial_index)
+    # A row mask may exclude complete trials (for example instruction trials),
+    # so do not create outer folds from trials with no selected rows.
+    trials = np.unique(prepared.data.trial_index[selected])
     if cv_config.folds > trials.size:
         raise ValueError(
             f"CV requests {cv_config.folds} folds for only {trials.size} trials"
@@ -284,6 +286,7 @@ def evaluate(
             train_blocks,
             train_gains,
             fit_config,
+            trial_index=prepared.data.trial_index[train_rows],
         )
         full_prediction = predict_parameters(
             prepared,
@@ -322,6 +325,7 @@ def evaluate(
                     full_state.beta,
                     full_state.intercept,
                     fit_config,
+                    trial_index=prepared.data.trial_index[train_rows],
                     keep=keep,
                     alpha=full_gain_alpha,
                 )
@@ -340,6 +344,7 @@ def evaluate(
                     reduced_train_blocks,
                     train_gains,
                     fit_config,
+                    trial_index=prepared.data.trial_index[train_rows],
                     keep_gains=keep,
                 )
                 reduced_beta = reduced_state.beta

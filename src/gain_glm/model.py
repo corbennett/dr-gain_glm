@@ -523,6 +523,8 @@ class FitConfig:
             raise ValueError("regularizer must be 'ridge' or 'lasso'")
         if not self.alphas or any(a <= 0 for a in self.alphas):
             raise ValueError("alphas must contain positive values")
+        if self.inner_cv_folds is not None and self.inner_cv_folds < 2:
+            raise ValueError("inner_cv_folds must be at least two")
         if self.max_iter < 1 or self.patience < 1 or self.tol < 0:
             raise ValueError("invalid ALS convergence settings")
 

@@ -27,6 +27,11 @@ def main() -> None:
         help="Override the selected models' time-bin width in seconds",
     )
     parser.add_argument("--max-iter", type=int, default=FitConfig().max_iter)
+    parser.add_argument(
+        "--use-instruction-trials",
+        action="store_true",
+        help="Include instruction trials (default: exclude them)",
+    )
     args = parser.parse_args()
 
     models = [MODELS[name] for name in args.models]
@@ -41,6 +46,7 @@ def main() -> None:
         dropouts=args.dropout,
         fit=FitConfig(max_iter=args.max_iter),
         cv=CVConfig(folds=args.folds, seed=args.fold_seed),
+        use_instruction_trials=args.use_instruction_trials,
     )
     print(table)
     print(

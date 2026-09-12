@@ -14,7 +14,7 @@ import polars as pl
 from joblib import Parallel, delayed
 from threadpoolctl import threadpool_limits
 
-from .design import PreparedDesign, compile_design
+from .design import PreparedDesign
 from .dynamic_routing import (
     DEFAULT_MODEL,
     MODELS,
@@ -61,6 +61,7 @@ def fit_session(
     n_jobs: int = -1,
     limit: int | None = None,
     qc_column: str = QC_COLUMN,
+    use_instruction_trials: bool = False,
     overwrite: bool = False,
 ) -> Path:
     """Fit every selected unit while reusing one prepared session design."""
@@ -73,7 +74,11 @@ def fit_session(
     units = qc_unit_ids(nwb_path, qc_column=qc_column)
     if limit is not None:
         units = units[:limit]
-    session = load_session(nwb_path, model)
+    session = load_session(
+        nwb_path,
+        model,
+        use_instruction_trials=use_instruction_trials,
+    )
     prepared = prepare(session, model)
     targets = {unit: load_unit_target(session, unit) for unit in units}
     fit_config = FitConfig() if fit is None else fit
@@ -91,6 +96,7 @@ def fit_session(
         "dt": model.dt,
         "fit_window": model.fit_window,
         "fit_events": model.fit_events,
+        "use_instruction_trials": use_instruction_trials,
         "units": dict(results),
     }
     with output_path.open("w") as stream:
@@ -108,6 +114,7 @@ def compare_models(
     fit: FitConfig | None = None,
     cv: CVConfig | None = None,
     unit_limit: int = 8,
+    use_instruction_trials: bool = False,
 ) -> pl.DataFrame:
     """Compare full-model variants using one session load and target cache."""
     if not models:
@@ -121,9 +128,12 @@ def compare_models(
         for model in models[1:]
     ):
         raise ValueError("compared models must use the same fit window and events")
-    session = load_session(nwb_path, *models)
-    inputs = session.data
-    prepared = {model.name: compile_design(model, inputs) for model in models}
+    session = load_session(
+        nwb_path,
+        *models,
+        use_instruction_trials=use_instruction_trials,
+    )
+    prepared = {model.name: prepare(session, model) for model in models}
     if len(prepared) != len(models):
         raise ValueError("model names must be unique")
     units = (
@@ -213,6 +223,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         help="Override the selected model's time-bin width in seconds",
     )
     parser.add_argument("--max-iter", type=int, default=FitConfig().max_iter)
+    parser.add_argument(
+        "--use-instruction-trials",
+        action="store_true",
+        help="Include instruction trials (default: exclude them)",
+    )
     parser.add_argument("--n-jobs", type=int, default=-1)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--qc-column", default=QC_COLUMN)
@@ -232,6 +247,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         n_jobs=args.n_jobs,
         limit=args.limit,
         qc_column=args.qc_column,
+        use_instruction_trials=args.use_instruction_trials,
         overwrite=args.overwrite,
     )
 
