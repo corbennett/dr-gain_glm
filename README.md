@@ -370,6 +370,14 @@ result = prepared.evaluate(
 and reads only the corresponding NWB streams. Pass multiple models as
 additional arguments to load their union once for model comparisons.
 
+For Dynamic Routing sessions, the 25 ms grid is constructed independently in
+each trial with `stim_start_time` as an exact bin edge. Any partial interval of
+less than one bin at the beginning or end of a trial is discarded. Spike
+targets and continuous signals are sampled on those aligned bins, and temporal
+convolutions are reset at trial boundaries so no lagged value crosses between
+concatenated trials. `SessionData.bin_starts` records the absolute start time of
+every retained row.
+
 Available full-model declarations are exposed through `MODELS`:
 
 - `default`

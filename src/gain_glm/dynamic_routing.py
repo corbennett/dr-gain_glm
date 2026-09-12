@@ -16,11 +16,9 @@ import polars as pl
 from .data import (
     ModelData,
     TimedSignal,
-    bin_spike_times,
-    make_trial_index,
-    windows_mask,
+    _window_bin_bounds,
 )
-from .design import PreparedDesign, compile_design
+from .design import PreparedDesign, _bin_rows, compile_design
 from .model import Dropout, Event, Gain, ModelSpec, Signal
 
 lazynwb.config.anon = True
@@ -97,7 +95,6 @@ BEHAVIOR_PREDICTORS = (
         normalize="zscore",
         groups=("behavior",),
         orthogonalize_against="context_baseline",
-
     ),
     Signal(
         "pupil_area",
@@ -175,7 +172,7 @@ DEFAULT_DROPOUTS = (
         "context",
         "licks",
         name="lick_context_gain",
-        ),
+    ),
     Dropout.predictors("context_baseline"),
 )
 
@@ -307,13 +304,14 @@ MODELS: Mapping[str, ModelSpec] = {
 
 @dataclass(frozen=True)
 class SessionData:
-    """Session bounds and the model-specific inputs loaded from NWB."""
+    """Session bounds and stimulus-aligned Dynamic Routing model rows."""
 
     nwb_path: str
     task_start_time: float
     task_end_time: float
     data: ModelData
     included_trial_mask: np.ndarray
+    bin_starts: np.ndarray
 
     def __post_init__(self) -> None:
         included = np.asarray(self.included_trial_mask, dtype=bool).ravel().copy()
@@ -323,8 +321,19 @@ class SessionData:
             )
         if not included.any():
             raise ValueError("included_trial_mask must include at least one trial")
+        bin_starts = np.asarray(self.bin_starts, dtype=float).ravel().copy()
+        if bin_starts.size != self.data.n_time:
+            raise ValueError("bin_starts must have one value per model row")
+        if not np.all(np.isfinite(bin_starts)) or np.any(np.diff(bin_starts) <= 0):
+            raise ValueError("bin_starts must be finite and strictly increasing")
+        if bin_starts[0] < self.task_start_time - 1e-9 or (
+            bin_starts[-1] + self.data.dt > self.task_end_time + 1e-9
+        ):
+            raise ValueError("bin_starts must lie within the task interval")
         included.setflags(write=False)
+        bin_starts.setflags(write=False)
         object.__setattr__(self, "included_trial_mask", included)
+        object.__setattr__(self, "bin_starts", bin_starts)
 
     @property
     def dt(self) -> float:
@@ -450,6 +459,90 @@ def _pose_signal(
     )
 
 
+def _snap_grid_coordinates(values: np.ndarray) -> np.ndarray:
+    """Snap floating-point values that are effectively integer bin offsets."""
+    nearest = np.rint(values)
+    return np.where(np.isclose(values, nearest, rtol=0, atol=1e-9), nearest, values)
+
+
+def _stimulus_aligned_grid(
+    starts: np.ndarray,
+    ends: np.ndarray,
+    stimulus_times: np.ndarray,
+    dt: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return complete per-trial bins whose zero edge is stimulus onset."""
+    starts = np.asarray(starts, dtype=float).ravel()
+    ends = np.asarray(ends, dtype=float).ravel()
+    stimulus_times = np.asarray(stimulus_times, dtype=float).ravel()
+    if not (starts.size == ends.size == stimulus_times.size) or starts.size == 0:
+        raise ValueError("trials must provide equally sized starts, ends, and stimuli")
+    if not (
+        np.all(np.isfinite(starts))
+        and np.all(np.isfinite(ends))
+        and np.all(np.isfinite(stimulus_times))
+    ):
+        raise ValueError("trial times and stimulus times must be finite")
+    if np.any(ends <= starts):
+        raise ValueError("each trial end must exceed its start")
+    if np.any(stimulus_times < starts) or np.any(stimulus_times >= ends):
+        raise ValueError("each stimulus onset must lie within its trial")
+
+    first_lags = np.ceil(_snap_grid_coordinates((starts - stimulus_times) / dt)).astype(
+        int
+    )
+    end_lags = np.floor(_snap_grid_coordinates((ends - stimulus_times) / dt)).astype(
+        int
+    )
+    counts = end_lags - first_lags
+    if np.any(counts <= 0):
+        raise ValueError("each trial must contain at least one complete aligned bin")
+
+    bin_starts = np.concatenate(
+        [
+            stimulus + np.arange(first, end) * dt
+            for stimulus, first, end in zip(stimulus_times, first_lags, end_lags)
+        ]
+    )
+    trial_index = np.repeat(np.arange(starts.size), counts)
+    return bin_starts, trial_index
+
+
+def _event_windows_mask(
+    session: SessionData,
+    event_sources: tuple[str, ...],
+    window: tuple[float, float],
+) -> np.ndarray:
+    """Select event windows without allowing them to cross trial boundaries."""
+    missing = set(event_sources) - set(session.data.events)
+    if missing:
+        raise KeyError(f"fit event sources are missing: {sorted(missing)}")
+    event_times = np.concatenate(
+        [session.data.events[source] for source in event_sources]
+    )
+    if not np.all(np.isfinite(event_times)):
+        raise ValueError("fit event sources contain non-finite times")
+
+    relative_bin_starts = session.bin_starts - session.task_start_time
+    event_rows = _bin_rows(
+        event_times,
+        session.dt,
+        session.n_time,
+        relative_bin_starts,
+    )
+    low, high = _window_bin_bounds(window, session.dt)
+    mask = np.zeros(session.n_time, dtype=bool)
+    trial_index = session.data.trial_index
+    for event_row in event_rows:
+        trial = trial_index[event_row]
+        trial_start = int(np.searchsorted(trial_index, trial, side="left"))
+        trial_end = int(np.searchsorted(trial_index, trial, side="right"))
+        first = max(trial_start, event_row + low)
+        last = min(trial_end, event_row + high)
+        mask[first:last] = True
+    return mask
+
+
 def load_session(
     nwb_path: str,
     model: ModelSpec,
@@ -480,14 +573,16 @@ def load_session(
         raise ValueError("no non-instruction trials are available")
     starts = trials.select("start_time").to_numpy().ravel()
     ends = trials.select("stop_time").to_numpy().ravel()
+    stimulus_times = trials.select("stim_start_time").to_numpy().ravel()
     task_start = float(starts[0])
     task_end = float(ends[-1])
-    n_time = int(np.floor((task_end - task_start) / model.dt))
+    aligned_trial_ends = np.append(starts[1:], task_end)
+    bin_starts, trial_index = _stimulus_aligned_grid(
+        starts, aligned_trial_ends, stimulus_times, model.dt
+    )
 
     start_relative = starts - task_start
-    duration = task_end - task_start
-    trial_ends = np.append(start_relative[1:], duration)
-    trial_index = make_trial_index(start_relative, trial_ends, model.dt, n_time=n_time)
+    trial_ends = aligned_trial_ends - task_start
     event_trials = trials.filter(pl.Series("included", included_trial_mask))
 
     events = {
@@ -574,7 +669,9 @@ def load_session(
         if "trial_context" in trial_value_sources:
             trial_values["trial_context"] = trial_context
     if "time" in signal_sources:
-        signals["time"] = TimedSignal(np.arange(n_time) / n_time)
+        signals["time"] = TimedSignal(
+            (bin_starts + model.dt / 2 - task_start) / (task_end - task_start)
+        )
 
     data = ModelData(
         dt=model.dt,
@@ -589,24 +686,36 @@ def load_session(
         task_end_time=task_end,
         data=data,
         included_trial_mask=included_trial_mask,
+        bin_starts=bin_starts,
     )
 
 
 def stimulus_mask(
-    data: ModelData,
+    session: SessionData,
     window: tuple[float, float] = STIMULUS_FIT_WINDOW,
 ) -> np.ndarray:
-    stimulus_times = np.concatenate([data.events[name] for name in STIMULUS_EVENTS])
-    return windows_mask(stimulus_times, data.n_time, data.dt, window)
+    return _event_windows_mask(session, STIMULUS_EVENTS, window)
 
 
 def prepare(
     session: SessionData,
     model: ModelSpec,
 ) -> PreparedDesign:
-    """Build one session-shared design for a declared model."""
+    """Build one trial-segmented design on the stimulus-aligned grid."""
     included_rows = session.included_trial_mask[session.data.trial_index]
-    return compile_design(model, session.data, row_mask=included_rows)
+    fit_mask = (
+        None
+        if model.fit_window is None
+        else _event_windows_mask(session, model.fit_events, model.fit_window)
+    )
+    return compile_design(
+        model,
+        session.data,
+        fit_mask=fit_mask,
+        row_mask=included_rows,
+        _bin_starts=session.bin_starts - session.task_start_time,
+        _convolution_segments=session.data.trial_index,
+    )
 
 
 def qc_unit_ids(nwb_path: str, *, qc_column: str = QC_COLUMN) -> list[str]:
@@ -628,9 +737,12 @@ def load_unit_target(session: SessionData, unit_id: str) -> np.ndarray:
     )
     if spikes.is_empty():
         raise ValueError(f"unit {unit_id!r} was not found in {session.nwb_path}")
-    return bin_spike_times(
+    rows = _bin_rows(
         spikes[0].to_numpy(),
-        session.task_start_time,
-        session.task_end_time,
         session.dt,
+        session.n_time,
+        session.bin_starts,
     )
+    target = np.zeros(session.n_time)
+    np.add.at(target, rows, 1.0)
+    return target

@@ -75,24 +75,58 @@ def _lags(window: tuple[float, float], dt: float) -> np.ndarray:
     return np.arange(low, high)
 
 
-def _event_series(times: np.ndarray, dt: float, n_time: int) -> np.ndarray:
+def _bin_rows(
+    times: np.ndarray,
+    dt: float,
+    n_time: int,
+    bin_starts: np.ndarray | None = None,
+) -> np.ndarray:
+    values = np.asarray(times, dtype=float).ravel()
+    if bin_starts is None:
+        bins = np.floor(values / dt).astype(int)
+        return bins[(bins >= 0) & (bins < n_time)]
+
+    bins = np.searchsorted(bin_starts, values, side="right") - 1
+    in_range = (bins >= 0) & (bins < n_time)
+    valid = np.zeros(values.size, dtype=bool)
+    valid_indices = np.flatnonzero(in_range)
+    valid[valid_indices] = values[valid_indices] < bin_starts[bins[valid_indices]] + dt
+    return bins[valid]
+
+
+def _event_series(
+    times: np.ndarray,
+    dt: float,
+    n_time: int,
+    bin_starts: np.ndarray | None = None,
+) -> np.ndarray:
     series = np.zeros(n_time)
-    bins = np.floor(np.asarray(times, dtype=float).ravel() / dt).astype(int)
-    bins = bins[(bins >= 0) & (bins < n_time)]
+    bins = _bin_rows(times, dt, n_time, bin_starts)
     np.add.at(series, bins, 1.0)
     return series
 
 
 def _design_block(
-    series: np.ndarray, lags: np.ndarray, basis: np.ndarray
+    series: np.ndarray,
+    lags: np.ndarray,
+    basis: np.ndarray,
+    segments: np.ndarray | None = None,
 ) -> np.ndarray:
     n_time = series.size
     lagged = np.zeros((n_time, lags.size))
     for column, lag in enumerate(lags):
         if lag >= 0 and lag < n_time:
-            lagged[lag:, column] = series[: n_time - lag]
+            values = series[: n_time - lag]
+            if segments is not None:
+                values = np.where(segments[lag:] == segments[: n_time - lag], values, 0)
+            lagged[lag:, column] = values
         elif lag < 0 and -lag < n_time:
-            lagged[: n_time + lag, column] = series[-lag:]
+            values = series[-lag:]
+            if segments is not None:
+                values = np.where(
+                    segments[: n_time + lag] == segments[-lag:], values, 0
+                )
+            lagged[: n_time + lag, column] = values
     return lagged @ basis
 
 
@@ -130,7 +164,10 @@ def _normalize(values: np.ndarray, mode: str) -> np.ndarray:
 
 
 def _resample_signal(
-    signal: TimedSignal, predictor: Signal, data: ModelData
+    signal: TimedSignal,
+    predictor: Signal,
+    data: ModelData,
+    bin_starts: np.ndarray | None = None,
 ) -> np.ndarray:
     values = _mark_outliers(signal.values, predictor.outlier_zscore)
     if signal.times is None:
@@ -162,11 +199,23 @@ def _resample_signal(
     times = times[order]
 
     if predictor.align == "interp":
-        centers = (np.arange(data.n_time) + 0.5) * data.dt
+        centers = (
+            (np.arange(data.n_time) + 0.5) * data.dt
+            if bin_starts is None
+            else bin_starts + data.dt / 2
+        )
         output = np.interp(centers, times, values)
     else:
-        bins = np.floor(times / data.dt).astype(int)
-        in_range = (bins >= 0) & (bins < data.n_time)
+        if bin_starts is None:
+            bins = np.floor(times / data.dt).astype(int)
+            in_range = (bins >= 0) & (bins < data.n_time)
+        else:
+            bins = np.searchsorted(bin_starts, times, side="right") - 1
+            in_range = (bins >= 0) & (bins < data.n_time)
+            valid_indices = np.flatnonzero(in_range)
+            in_range[valid_indices] &= (
+                times[valid_indices] < bin_starts[bins[valid_indices]] + data.dt
+            )
         bins = bins[in_range]
         values = values[in_range]
         sums = np.zeros(data.n_time)
@@ -244,6 +293,7 @@ class PreparedDesign:
     bases: Mapping[str, np.ndarray]
     layout: ParameterLayout
     fit_mask: np.ndarray
+    _convolution_segments: np.ndarray | None = None
 
     @property
     def has_history(self) -> bool:
@@ -269,7 +319,10 @@ class PreparedDesign:
                 )
             for predictor in history_terms:
                 blocks[predictor.name] = _design_block(
-                    values, self.lags[predictor.name], self.bases[predictor.name]
+                    values,
+                    self.lags[predictor.name],
+                    self.bases[predictor.name],
+                    self._convolution_segments,
                 )
         return blocks
 
@@ -334,17 +387,38 @@ def compile_design(
     *,
     fit_mask: np.ndarray | None = None,
     row_mask: np.ndarray | None = None,
+    _bin_starts: np.ndarray | None = None,
+    _convolution_segments: np.ndarray | None = None,
 ) -> PreparedDesign:
     """Resolve all named inputs and precompute target-independent convolutions.
 
     ``row_mask`` can be used to exclude complete classes of rows (for example,
     instruction trials) while retaining the model's event-anchored fit window.
-    It is intersected with the resolved fit mask.
+    It is intersected with the resolved fit mask. The private grid arguments
+    support the Dynamic Routing adapter's stimulus-aligned trial segments.
     """
     if not np.isclose(spec.dt, data.dt):
-        raise ValueError(
-            f"model dt {spec.dt} does not match data dt {data.dt}"
+        raise ValueError(f"model dt {spec.dt} does not match data dt {data.dt}")
+    bin_starts = None
+    if _bin_starts is not None:
+        bin_starts = np.asarray(_bin_starts, dtype=float).ravel().copy()
+        if bin_starts.size != data.n_time:
+            raise ValueError(
+                f"_bin_starts has length {bin_starts.size}, expected {data.n_time}"
+            )
+        if not np.all(np.isfinite(bin_starts)) or np.any(np.diff(bin_starts) <= 0):
+            raise ValueError("_bin_starts must be finite and strictly increasing")
+
+    convolution_segments = None
+    if _convolution_segments is not None:
+        convolution_segments = (
+            np.asarray(_convolution_segments, dtype=int).ravel().copy()
         )
+        if convolution_segments.size != data.n_time:
+            raise ValueError(
+                "_convolution_segments has length "
+                f"{convolution_segments.size}, expected {data.n_time}"
+            )
     if fit_mask is None:
         if spec.fit_window is None:
             mask = np.ones(data.n_time, dtype=bool)
@@ -356,7 +430,9 @@ def compile_design(
             for source in spec.fit_events:
                 times = data.events[source]
                 if not np.all(np.isfinite(times)):
-                    raise ValueError(f"fit event source {source!r} contains non-finite times")
+                    raise ValueError(
+                        f"fit event source {source!r} contains non-finite times"
+                    )
                 fit_times.append(times)
             mask = windows_mask(
                 np.concatenate(fit_times),
@@ -393,7 +469,7 @@ def compile_design(
                 f"{predictor.name!r} is missing"
             )
         signal_series[predictor.name] = _resample_signal(
-            data.signals[predictor.source], predictor, data
+            data.signals[predictor.source], predictor, data, bin_starts
         )
     signal_series = _orthogonalize_signals(spec, signal_series, mask)
 
@@ -421,13 +497,18 @@ def compile_design(
                 raise ValueError(
                     f"event source {predictor.source!r} contains non-finite times"
                 )
-            series = _event_series(data.events[predictor.source], data.dt, data.n_time)
+            series = _event_series(
+                data.events[predictor.source], data.dt, data.n_time, bin_starts
+            )
             blocks[predictor.name] = _design_block(
-                series, predictor_lags, predictor_basis
+                series, predictor_lags, predictor_basis, convolution_segments
             )
         elif isinstance(predictor, Signal):
             blocks[predictor.name] = _design_block(
-                signal_series[predictor.name], predictor_lags, predictor_basis
+                signal_series[predictor.name],
+                predictor_lags,
+                predictor_basis,
+                convolution_segments,
             )
 
     gain_by_time: dict[str, np.ndarray] = {}
@@ -451,6 +532,8 @@ def compile_design(
             values.setflags(write=False)
     mask = mask.copy()
     mask.setflags(write=False)
+    if convolution_segments is not None:
+        convolution_segments.setflags(write=False)
     return PreparedDesign(
         spec=spec,
         data=data,
@@ -460,4 +543,5 @@ def compile_design(
         bases=bases,
         layout=_parameter_layout(spec, bases),
         fit_mask=mask,
+        _convolution_segments=convolution_segments,
     )
