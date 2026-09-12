@@ -42,7 +42,7 @@ OUTCOME_EVENTS = (
 
 
 def _stimulus_predictors(
-    *, window: tuple[float, float] = (0, 0.1), n_basis: int = 4
+    *, window: tuple[float, float] = (0, 0.1), n_basis: int = 2
 ) -> tuple[Event, ...]:
     return tuple(
         Event(
