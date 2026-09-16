@@ -65,7 +65,7 @@ def _late_stimulus_predictors() -> tuple[Event, ...]:
             name,
             source=source,
             window=(0.1, 1),
-            n_basis=9,
+            n_basis=5,
             gains=("context",),
             groups=("stimulus", "late_stimulus", "task"),
         )
@@ -77,14 +77,14 @@ BEHAVIOR_PREDICTORS = (
     Event(
         "licks",
         window=(-0.1, 0.1),
-        n_basis=4,
+        n_basis=2,
         gains=("context",),
         groups=("behavior", "action"),
     ),
     Event(
         "rewards",
-        window=(-0.2, 1),
-        n_basis=12,
+        window=(-0.2, 0.2),
+        n_basis=4,
         gains=("context",),
         groups=("behavior", "outcome"),
     ),
@@ -151,6 +151,21 @@ BEHAVIOR_PREDICTORS = (
     ),
 )
 
+TASK_PREDICTORS = (
+    Event(
+        'is_hit',
+        window=(0.1, 1),
+        n_basis=5,
+        groups=("task"),
+    ),
+    Event(
+        'is_false_alarm',
+        window=(0.1, 1),
+        n_basis=5,
+        groups=("task"),
+    ),
+)
+
 DEFAULT_DROPOUTS = (
     # Dropout.gain("context"),
     Dropout.gain_terms(
@@ -158,21 +173,31 @@ DEFAULT_DROPOUTS = (
         *STIMULUS_EVENTS,
         name="early_stim_context_gain",
     ),
+    *(Dropout.gain_terms(
+        "context",
+        stim_event,
+        name=f"early_{stim_event}_context_gain",
+    ) for stim_event in STIMULUS_EVENTS),
     Dropout.gain_terms(
         "context",
         *LATE_STIMULUS_PREDICTOR_NAMES,
         name="late_stim_context_gain",
     ),
-    # Dropout.gain_terms(
-    #     "context",
-    #     "rewards",
-    #     name="reward_context_gain",
-    # ),
-    # Dropout.gain_terms(
-    #     "context",
-    #     "licks",
-    #     name="lick_context_gain",
-    # ),
+    *(Dropout.gain_terms(
+        "context",
+        stim_event,
+        name=f"late_{stim_event}_context_gain",
+    ) for stim_event in LATE_STIMULUS_PREDICTOR_NAMES),    
+    Dropout.gain_terms(
+        "context",
+        "rewards",
+        name="reward_context_gain",
+    ),
+    Dropout.gain_terms(
+        "context",
+        "licks",
+        name="lick_context_gain",
+    ),
     Dropout.predictors("context_baseline"),
 )
 
