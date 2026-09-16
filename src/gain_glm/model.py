@@ -512,7 +512,7 @@ class FitConfig:
         default_factory=lambda: tuple(np.logspace(-3, 3, 25))
     )
     inner_cv_folds: int | None = None
-    max_iter: int = 100
+    max_iter: int = 200
     tol: float = 1e-3
     patience: int = 3
     verbose: bool = False
