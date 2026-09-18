@@ -360,16 +360,102 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(disabled_result.dropouts, {})
 
     def test_automatic_gain_alpha_is_reused_for_final_refit(self):
-        import gain_glm._solver as solver
-
         config = FitConfig(max_iter=2)
-        with mock.patch.object(solver, "RidgeCV", wraps=solver.RidgeCV) as ridge_cv:
-            fitted = self.prepared.fit(self.y, config=config)
+        fitted = self.prepared.fit(self.y, config=config)
 
-        self.assertEqual(ridge_cv.call_count, 2)  # kernel and initial gain selection
         selected = fitted.state.iterations[0].gain_alpha
         self.assertIsNotNone(selected)
         self.assertEqual(fitted.state.iterations[-1].gain_alpha, selected)
+
+    def test_sufficient_ridge_solver_matches_dense_solver(self):
+        from gain_glm._solver import (
+            _fit_state_dense,
+            fit_state,
+            predict_parameters,
+        )
+
+        blocks = self.prepared.blocks_for_target()
+        trial_index = self.prepared.data.trial_index
+        for config in (
+            FitConfig(kernel_alpha=1e-4, gain_alpha=1e-3, max_iter=20),
+            FitConfig(max_iter=20),
+        ):
+            with self.subTest(config=config):
+                dense = _fit_state_dense(
+                    self.prepared,
+                    self.y,
+                    blocks,
+                    self.prepared.gain_by_time,
+                    config,
+                    trial_index=trial_index,
+                )
+                sufficient = fit_state(
+                    self.prepared,
+                    self.y,
+                    blocks,
+                    self.prepared.gain_by_time,
+                    config,
+                    trial_index=trial_index,
+                )
+
+                self.assertEqual(len(sufficient.iterations), len(dense.iterations))
+                self.assertEqual(sufficient.converged, dense.converged)
+                self.assertEqual(
+                    sufficient.iterations[0].kernel_alpha,
+                    dense.iterations[0].kernel_alpha,
+                )
+                self.assertEqual(
+                    sufficient.iterations[0].gain_alpha,
+                    dense.iterations[0].gain_alpha,
+                )
+                np.testing.assert_allclose(sufficient.beta, dense.beta, atol=1e-12)
+                np.testing.assert_allclose(sufficient.gain, dense.gain, atol=1e-12)
+                self.assertAlmostEqual(sufficient.intercept, dense.intercept)
+
+                dense_prediction = predict_parameters(
+                    self.prepared,
+                    blocks,
+                    self.prepared.gain_by_time,
+                    dense.beta,
+                    dense.gain,
+                    dense.intercept,
+                )
+                sufficient_prediction = predict_parameters(
+                    self.prepared,
+                    blocks,
+                    self.prepared.gain_by_time,
+                    sufficient.beta,
+                    sufficient.gain,
+                    sufficient.intercept,
+                )
+                np.testing.assert_allclose(
+                    sufficient_prediction, dense_prediction, atol=1e-12
+                )
+
+        keep_gains = np.ones(self.prepared.layout.gain_size, dtype=bool)
+        keep_gains[-1] = False
+        config = FitConfig(kernel_alpha=1e-4, gain_alpha=1e-3, max_iter=20)
+        dense = _fit_state_dense(
+            self.prepared,
+            self.y,
+            blocks,
+            self.prepared.gain_by_time,
+            config,
+            trial_index=trial_index,
+            keep_gains=keep_gains,
+        )
+        sufficient = fit_state(
+            self.prepared,
+            self.y,
+            blocks,
+            self.prepared.gain_by_time,
+            config,
+            trial_index=trial_index,
+            keep_gains=keep_gains,
+        )
+        np.testing.assert_allclose(sufficient.beta, dense.beta, atol=1e-12)
+        np.testing.assert_allclose(sufficient.gain, dense.gain, atol=1e-12)
+        self.assertEqual(sufficient.gain[-1], 0.0)
 
     def test_inner_cv_keeps_all_bins_from_a_trial_together(self):
         from gain_glm._solver import _trial_cv

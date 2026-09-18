@@ -249,6 +249,15 @@ The gain regression always uses Ridge. Kernel basis coefficients are penalized
 by the selected kernel regularizer; gain offsets and trial-variable gain
 coefficients are Ridge-penalized. The overall model intercept is not.
 
+For Ridge kernel fits, the implementation forms the concatenated base design
+once per fit and caches cross-products grouped by the trial-level gain values
+(and by inner fold when alpha selection is needed). Kernel updates, gain
+updates, convergence metrics, and Ridge alpha comparisons then use those small
+sufficient-statistic matrices instead of rebuilding time-bin-level designs.
+This is algebraically equivalent to the dense Ridge ALS procedure. Lasso fits
+continue to use the dense design because L1 regression cannot be recovered
+from these cross-products alone.
+
 #### Automatic alpha selection
 
 `kernel_alpha` and `gain_alpha` are regularization strengths, not optimization
@@ -258,7 +267,7 @@ parameter. When a value is `None`, the fitter searches `FitConfig.alphas`
 corresponding ALS update and then holds the selected value fixed.
 
 `FitConfig.inner_cv_folds` controls the number of folds used by the
-scikit-learn alpha selector. It is separate from the outer CV configured by
+inner alpha selector. It is separate from the outer CV configured by
 `CVConfig`. Inner folds are trial-aware: all time bins from a
 trial are assigned to the same inner training or validation fold. With
 `inner_cv_folds=None`, five trial folds are used; an integer such as `5`

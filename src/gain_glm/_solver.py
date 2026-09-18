@@ -269,7 +269,7 @@ def predict_state(
     )
 
 
-def fit_state(
+def _fit_state_dense(
     prepared: PreparedDesign,
     y: np.ndarray,
     blocks: Mapping[str, np.ndarray],
@@ -462,6 +462,40 @@ def fit_state(
             final.max_abs_gain_change,
         )
     return FitState(beta, gain, intercept, tuple(iterations), converged)
+
+
+def fit_state(
+    prepared: PreparedDesign,
+    y: np.ndarray,
+    blocks: Mapping[str, np.ndarray],
+    gain_by_time: Mapping[str, np.ndarray],
+    config: FitConfig,
+    *,
+    trial_index: np.ndarray,
+    keep_gains: np.ndarray | None = None,
+) -> FitState:
+    """Fit parameters, using cached Ridge cross-products when supported."""
+    if config.regularizer == "ridge":
+        from ._sufficient import fit_state_sufficient
+
+        return fit_state_sufficient(
+            prepared,
+            y,
+            blocks,
+            gain_by_time,
+            config,
+            trial_index=trial_index,
+            keep_gains=keep_gains,
+        )
+    return _fit_state_dense(
+        prepared,
+        y,
+        blocks,
+        gain_by_time,
+        config,
+        trial_index=trial_index,
+        keep_gains=keep_gains,
+    )
 
 
 def _fit_mask(prepared: PreparedDesign, mask: np.ndarray | None) -> np.ndarray:
