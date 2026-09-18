@@ -436,6 +436,9 @@ while supplying an integer reproducibly randomizes whole trials among folds.
 Instruction trials are excluded by default; add `--use-instruction-trials` to
 include them.
 
+The session result JSON includes `runtime_seconds`, recording the total elapsed
+wall-clock time for the session fit.
+
 Model comparison and SLURM launchers are in `scripts/` and take model names as
 arguments instead of requiring source edits. The SLURM launcher forwards the
 same time-grid and outer-CV options to every session job:

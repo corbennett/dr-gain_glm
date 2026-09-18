@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from collections.abc import Sequence
 from dataclasses import replace as dataclass_replace
 from pathlib import Path
@@ -71,6 +72,7 @@ def fit_session(
         print(f"[{session_id}] {output_path} exists; skipping")
         return output_path
 
+    started = time.perf_counter()
     units = qc_unit_ids(nwb_path, qc_column=qc_column)
     if limit is not None:
         units = units[:limit]
@@ -97,6 +99,7 @@ def fit_session(
         "fit_window": model.fit_window,
         "fit_events": model.fit_events,
         "use_instruction_trials": use_instruction_trials,
+        "runtime_seconds": time.perf_counter() - started,
         "units": dict(results),
     }
     with output_path.open("w") as stream:

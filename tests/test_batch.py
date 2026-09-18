@@ -1,12 +1,21 @@
 import argparse
+import json
 import pickle
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import numpy as np
 
 from gain_glm import ModelData, ModelSpec, Signal, compile_design
-from gain_glm.batch import compare_models, main, parse_dropout, parse_positive_float
+from gain_glm.batch import (
+    compare_models,
+    fit_session,
+    main,
+    parse_dropout,
+    parse_positive_float,
+)
 
 
 class BatchTests(unittest.TestCase):
@@ -76,6 +85,27 @@ class BatchTests(unittest.TestCase):
         restored = pickle.loads(pickle.dumps(prepared))
         self.assertEqual(restored.spec.name, "synthetic")
         self.assertEqual(restored.base_blocks["x"].shape, (12, 1))
+
+    def test_fit_session_logs_elapsed_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            with (
+                mock.patch("gain_glm.batch.qc_unit_ids", return_value=[]),
+                mock.patch("gain_glm.batch.load_session"),
+                mock.patch("gain_glm.batch.prepare"),
+                mock.patch(
+                    "gain_glm.batch.time.perf_counter",
+                    side_effect=(10.0, 12.5),
+                ),
+            ):
+                fit_session("session.nwb", "session", output_dir, n_jobs=1)
+
+            result = json.loads((output_dir / "session.json").read_text())
+            has_separate_runtime_file = (output_dir / "session_runtime.json").exists()
+
+        self.assertEqual(result["session_id"], "session")
+        self.assertEqual(result["runtime_seconds"], 2.5)
+        self.assertFalse(has_separate_runtime_file)
 
     def test_model_comparison_requires_a_shared_time_grid_and_fit_rows(self):
         predictor = (Signal("x", window=(0, 0), n_basis=1),)
