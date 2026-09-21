@@ -172,6 +172,8 @@ def compare_models(
             }
             for name, dropout in result.dropouts.items():
                 row[f"delta_r2_{name}"] = dropout.delta_r2
+                if dropout.permutation is not None:
+                    row[f"permutation_p_{name}"] = dropout.permutation.p_value
             rows.append(row)
     return pl.DataFrame(rows)
 

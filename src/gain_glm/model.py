@@ -136,6 +136,7 @@ class ResolvedDropout:
     gains: tuple[str, ...]
     refit: Literal["gains", "full"]
     gain_terms: tuple[tuple[str, str], ...] = ()
+    permutation_test: bool = False
 
 
 @dataclass(frozen=True)
@@ -148,6 +149,7 @@ class Dropout:
     groups: tuple[str, ...] = ()
     refit: Literal["auto", "gains", "full"] = "auto"
     remove_gain_terms: tuple[tuple[str, str], ...] = ()
+    permutation_test: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "remove_predictors", tuple(self.remove_predictors))
@@ -168,6 +170,8 @@ class Dropout:
             raise ValueError("dropout names cannot be empty")
         if self.refit not in {"auto", "gains", "full"}:
             raise ValueError("refit must be 'auto', 'gains', or 'full'")
+        if not isinstance(self.permutation_test, bool):
+            raise TypeError("permutation_test must be a boolean")
 
     @classmethod
     def gain(
@@ -176,8 +180,14 @@ class Dropout:
         *,
         name: str | None = None,
         refit: Literal["auto", "gains", "full"] = "auto",
+        permutation_test: bool = False,
     ) -> Dropout:
-        return cls(name or gain, remove_gains=(gain,), refit=refit)
+        return cls(
+            name or gain,
+            remove_gains=(gain,),
+            refit=refit,
+            permutation_test=permutation_test,
+        )
 
     @classmethod
     def gain_terms(
@@ -186,6 +196,7 @@ class Dropout:
         *predictors: str,
         name: str | None = None,
         refit: Literal["auto", "gains", "full"] = "auto",
+        permutation_test: bool = False,
     ) -> Dropout:
         """Remove one gain's coefficient from selected predictors only."""
         if not predictors:
@@ -195,6 +206,7 @@ class Dropout:
             label,
             remove_gain_terms=tuple((gain, predictor) for predictor in predictors),
             refit=refit,
+            permutation_test=permutation_test,
         )
 
     @classmethod
@@ -203,9 +215,15 @@ class Dropout:
         *predictors: str,
         name: str | None = None,
         refit: Literal["auto", "full"] = "auto",
+        permutation_test: bool = False,
     ) -> Dropout:
         label = name or "+".join(predictors)
-        return cls(label, remove_predictors=tuple(predictors), refit=refit)
+        return cls(
+            label,
+            remove_predictors=tuple(predictors),
+            refit=refit,
+            permutation_test=permutation_test,
+        )
 
     @classmethod
     def group(
@@ -227,6 +245,7 @@ class Dropout:
         gain_terms: Sequence[tuple[str, str]] = (),
         groups: Sequence[str] = (),
         refit: Literal["auto", "gains", "full"] = "auto",
+        permutation_test: bool = False,
     ) -> Dropout:
         """Declare a mixed reduction using any combination of term selectors."""
         return cls(
@@ -236,6 +255,7 @@ class Dropout:
             remove_gain_terms=tuple(gain_terms),
             groups=tuple(groups),
             refit=refit,
+            permutation_test=permutation_test,
         )
 
     def resolve_for(self, spec: ModelSpec) -> ResolvedDropout:
@@ -284,6 +304,24 @@ class Dropout:
             raise ValueError(
                 f"dropout {self.name!r} removes predictors and therefore requires a full refit"
             )
+        permutation_gains = set(self.remove_gains)
+        permutation_gains.update(gain for gain, _ in self.remove_gain_terms)
+        if self.permutation_test:
+            if predictors and permutation_gains:
+                raise ValueError(
+                    f"dropout {self.name!r}: a permutation test cannot mix "
+                    "predictors and gain terms"
+                )
+            if predictors and len(predictors) != 1:
+                raise ValueError(
+                    f"dropout {self.name!r}: a predictor permutation test must "
+                    "select exactly one predictor"
+                )
+            if permutation_gains and len(permutation_gains) != 1:
+                raise ValueError(
+                    f"dropout {self.name!r}: a gain permutation test must "
+                    "select exactly one gain"
+                )
         return ResolvedDropout(
             name=self.name,
             predictors=tuple(p for p in spec.predictor_names if p in predictors),
@@ -292,6 +330,7 @@ class Dropout:
                 term for term in ordered_gain_terms if term in self.remove_gain_terms
             ),
             refit=strategy,
+            permutation_test=self.permutation_test,
         )
 
     def resolve(self, prepared: PreparedDesign) -> ResolvedDropout:

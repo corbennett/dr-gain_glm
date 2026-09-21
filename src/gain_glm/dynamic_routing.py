@@ -153,13 +153,13 @@ BEHAVIOR_PREDICTORS = (
 
 TASK_PREDICTORS = (
     Event(
-        'is_hit',
+        "is_hit",
         window=(0.1, 1),
         n_basis=5,
         groups=("task"),
     ),
     Event(
-        'is_false_alarm',
+        "is_false_alarm",
         window=(0.1, 1),
         n_basis=5,
         groups=("task"),
@@ -172,33 +172,45 @@ DEFAULT_DROPOUTS = (
         "context",
         *STIMULUS_EVENTS,
         name="early_stim_context_gain",
+        permutation_test=True,
     ),
-    *(Dropout.gain_terms(
-        "context",
-        stim_event,
-        name=f"early_{stim_event}_context_gain",
-    ) for stim_event in STIMULUS_EVENTS),
+    *(
+        Dropout.gain_terms(
+            "context",
+            stim_event,
+            name=f"early_{stim_event}_context_gain",
+            permutation_test=True,
+        )
+        for stim_event in STIMULUS_EVENTS
+    ),
     Dropout.gain_terms(
         "context",
         *LATE_STIMULUS_PREDICTOR_NAMES,
         name="late_stim_context_gain",
+        permutation_test=True,
     ),
-    *(Dropout.gain_terms(
-        "context",
-        stim_event,
-        name=f"late_{stim_event}_context_gain",
-    ) for stim_event in LATE_STIMULUS_PREDICTOR_NAMES),    
+    *(
+        Dropout.gain_terms(
+            "context",
+            stim_event,
+            name=f"late_{stim_event}_context_gain",
+            permutation_test=True,
+        )
+        for stim_event in LATE_STIMULUS_PREDICTOR_NAMES
+    ),
     Dropout.gain_terms(
         "context",
         "rewards",
         name="reward_context_gain",
+        permutation_test=True,
     ),
     Dropout.gain_terms(
         "context",
         "licks",
         name="lick_context_gain",
+        permutation_test=True,
     ),
-    Dropout.predictors("context_baseline"),
+    Dropout.predictors("context_baseline", permutation_test=True),
 )
 
 DEFAULT_MODEL = ModelSpec(
@@ -225,8 +237,8 @@ NO_HIT_LONG_STIM_MODEL = ModelSpec(
     fit_window=STIMULUS_FIT_WINDOW,
     fit_events=STIMULUS_EVENTS,
     dropouts=(
-        Dropout.gain("context"),
-        Dropout.predictors("context_baseline"),
+        Dropout.gain("context", permutation_test=True),
+        Dropout.predictors("context_baseline", permutation_test=True),
     ),
 )
 
@@ -312,7 +324,7 @@ ONLY_BASELINE_MODEL = ModelSpec(
     dt=DEFAULT_DT,
     fit_window=(-1.5, 0),
     fit_events=STIMULUS_EVENTS,
-    dropouts=(Dropout.predictors("context_baseline"),),
+    dropouts=(Dropout.predictors("context_baseline", permutation_test=True),),
 )
 
 MODELS: Mapping[str, ModelSpec] = {

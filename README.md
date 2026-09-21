@@ -70,8 +70,13 @@ model = ModelSpec(
     fit_window=(-0.5, 1.0),
     fit_events=("cue",),
     dropouts=(
-        Dropout.gain("context"),
-        Dropout.gain_terms("context", "cue", name="cue_context_gain"),
+        Dropout.gain("context", permutation_test=True),
+        Dropout.gain_terms(
+            "context",
+            "cue",
+            name="cue_context_gain",
+            permutation_test=True,
+        ),
         Dropout.group("behavior"),
         Dropout.predictors("running", name="running_only"),
     ),
@@ -161,6 +166,38 @@ comparison changes only the requested gain terms. Results include separate
 convergence diagnostics for the final all-data fit, every full-model CV fold,
 and every iterative reduced-model fold; the legacy top-level `converged` field
 continues to describe only the final all-data fit.
+
+Set `permutation_test=True` on a gain-only dropout to additionally run a
+trial-level circular-shift test. For each outer fold, the reduced model is fit
+without the requested gain coefficients. Its kernels are then frozen, and all
+gain coefficients are fit once for each shifted version of the requested
+gain's trial values. Only the gain terms selected by that dropout receive the
+shifted values; all other gain and predictor inputs retain their observed
+alignment.
+
+The shift set includes shift zero and removes assignments duplicated by the
+gain sequence's circular periodicity or by a global sign flip. Each class uses
+the shortest signed lag, with a positive lag used for an exact tie. The test
+then uses one common trial window on which none of those lags wraps around the
+start or end of the session. This window is used for both the
+permutation-specific reduced fit and every shifted fit and held-out score; the
+ordinary CV and dropout metrics still use the original evaluation mask.
+`PermutationTestResult.valid_trials` and `omitted_trials` expose the exact
+support.
+
+For example, an exactly alternating schedule with 10 trials per block has the
+10 representatives `[-4, -3, -2, -1, 0, 1, 2, 3, 4, 5]` (the result stores
+zero first). The shared window omits the first 5 and last 4 eligible trials, so
+a six-block session evaluates trials 6 through 56 in one-based numbering. The
+reported one-sided p-value is the fraction of pooled held-out delta-R2 values
+at least as large as the shift-zero value.
+
+A one-column predictor that is constant within each trial can also request the
+test, as in `Dropout.predictors("context_baseline", permutation_test=True)`.
+In that case the reduced model omits the predictor, its gains are frozen, and
+the kernels are fit once at each shifted alignment. The ordinary dropout
+metrics remain the comparisons described below; permutation results are stored
+separately on `DropoutResult.permutation`.
 
 ### Current fitting procedure
 

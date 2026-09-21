@@ -201,6 +201,49 @@ def _fit_gain_coefficients(
     return gain, selected
 
 
+def refit_kernels(
+    prepared: PreparedDesign,
+    y: np.ndarray,
+    blocks: Mapping[str, np.ndarray],
+    gain_by_time: Mapping[str, np.ndarray],
+    gain: np.ndarray,
+    config: FitConfig,
+    *,
+    trial_index: np.ndarray,
+    alpha: float | None = None,
+) -> tuple[np.ndarray, float, float]:
+    """Fit kernels once while holding all gain parameters fixed."""
+    x = _kernel_design(prepared, blocks, gain_by_time, gain)
+    selected = config.kernel_alpha if alpha is None else alpha
+    if config.regularizer == "lasso":
+        if selected is None:
+            solver = LassoCV(
+                alphas=np.asarray(config.alphas),
+                cv=_trial_cv(trial_index, config.inner_cv_folds),
+                fit_intercept=True,
+                max_iter=10_000,
+            )
+        else:
+            solver = Lasso(
+                alpha=selected,
+                fit_intercept=True,
+                max_iter=10_000,
+            )
+    elif selected is None:
+        solver = RidgeCV(
+            alphas=np.asarray(config.alphas),
+            cv=_trial_cv(trial_index, config.inner_cv_folds),
+            fit_intercept=True,
+            scoring="neg_mean_squared_error",
+        )
+    else:
+        solver = Ridge(alpha=selected, fit_intercept=True)
+    solver.fit(x, y)
+    if selected is None:
+        selected = float(solver.alpha_)
+    return solver.coef_.copy(), float(solver.intercept_), float(selected)
+
+
 def refit_gains(
     prepared: PreparedDesign,
     y: np.ndarray,
@@ -282,9 +325,7 @@ def _fit_state_dense(
     """Run ALS on arrays already restricted to the desired training rows."""
     trial_ids = np.asarray(trial_index).ravel()
     if trial_ids.size != y.size:
-        raise ValueError(
-            f"trial_index has length {trial_ids.size}, expected {y.size}"
-        )
+        raise ValueError(f"trial_index has length {trial_ids.size}, expected {y.size}")
     gain = _initial_gain(prepared)
     beta = np.zeros(prepared.layout.beta_size)
     intercept = 0.0

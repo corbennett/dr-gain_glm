@@ -194,9 +194,7 @@ class SpecificationTests(unittest.TestCase):
 
     def test_compile_fails_on_missing_named_source(self):
         data = ModelData(dt=0.1, trial_index=np.repeat(np.arange(2), 5))
-        spec = ModelSpec(
-            (Signal("missing", window=(0, 0), n_basis=1),), dt=0.1
-        )
+        spec = ModelSpec((Signal("missing", window=(0, 0), n_basis=1),), dt=0.1)
         with self.assertRaisesRegex(KeyError, "signal source 'missing'"):
             compile_design(spec, data)
 
@@ -289,7 +287,9 @@ class SpecificationTests(unittest.TestCase):
     def test_dropout_resolves_groups_and_refit_strategy(self):
         prepared, _ = synthetic_problem()
         gain = Dropout.gain("context").resolve(prepared)
-        gain_term = Dropout.gain_terms("context", "x").resolve(prepared)
+        gain_term = Dropout.gain_terms("context", "x", permutation_test=True).resolve(
+            prepared
+        )
         behavior = Dropout.group("behavior").resolve(prepared)
 
         self.assertEqual(gain.gains, ("context",))
@@ -297,6 +297,7 @@ class SpecificationTests(unittest.TestCase):
         self.assertEqual(gain_term.gains, ())
         self.assertEqual(gain_term.gain_terms, (("context", "x"),))
         self.assertEqual(gain_term.refit, "gains")
+        self.assertTrue(gain_term.permutation_test)
         self.assertEqual(behavior.predictors, ("nuisance",))
         self.assertEqual(behavior.refit, "full")
 
@@ -318,6 +319,14 @@ class SpecificationTests(unittest.TestCase):
         self.assertEqual(mixed.gains, ("context",))
         self.assertEqual(mixed.gain_terms, ())
         self.assertEqual(mixed.refit, "full")
+
+        with self.assertRaisesRegex(ValueError, "cannot mix"):
+            Dropout.terms(
+                "mixed_permutation",
+                predictors=("nuisance",),
+                gains=("context",),
+                permutation_test=True,
+            ).resolve(prepared)
 
 
 class EvaluationTests(unittest.TestCase):
@@ -462,13 +471,9 @@ class EvaluationTests(unittest.TestCase):
 
         trial_index = np.repeat(np.arange(8), 5)
         splitter = _trial_cv(trial_index, requested_folds=4)
-        for train_rows, validation_rows in splitter.split(
-            np.zeros(trial_index.size)
-        ):
+        for train_rows, validation_rows in splitter.split(np.zeros(trial_index.size)):
             self.assertTrue(
-                set(trial_index[train_rows]).isdisjoint(
-                    trial_index[validation_rows]
-                )
+                set(trial_index[train_rows]).isdisjoint(trial_index[validation_rows])
             )
             self.assertGreater(validation_rows.size, 0)
 
@@ -571,9 +576,7 @@ class EvaluationTests(unittest.TestCase):
         np.testing.assert_equal(
             result.dropouts["context"].delta_r2_per_fold.shape, (3,)
         )
-        self.assertIsNone(
-            result.dropouts["context"].reduced_diagnostics_per_fold
-        )
+        self.assertIsNone(result.dropouts["context"].reduced_diagnostics_per_fold)
         self.assertEqual(
             len(result.dropouts["behavior"].reduced_diagnostics_per_fold), 3
         )
@@ -595,9 +598,7 @@ class EvaluationTests(unittest.TestCase):
                 np.sum(
                     (
                         self.y[np.isin(self.prepared.data.trial_index, fold)]
-                        - self.y[
-                            np.isin(self.prepared.data.trial_index, fold)
-                        ].mean()
+                        - self.y[np.isin(self.prepared.data.trial_index, fold)].mean()
                     )
                     ** 2
                 )
@@ -608,9 +609,9 @@ class EvaluationTests(unittest.TestCase):
         expected_full = 1 - np.sum((1 - result.cv.r2_per_fold) * fold_tss) / global_tss
 
         dropout = result.dropouts["context"]
-        expected_reduced = 1 - np.sum(
-            (1 - dropout.reduced_r2_per_fold) * fold_tss
-        ) / global_tss
+        expected_reduced = (
+            1 - np.sum((1 - dropout.reduced_r2_per_fold) * fold_tss) / global_tss
+        )
 
         self.assertAlmostEqual(result.cv.r2_pooled, expected_full)
         self.assertAlmostEqual(dropout.reduced_r2_pooled, expected_reduced)
@@ -631,9 +632,7 @@ class EvaluationTests(unittest.TestCase):
             return state
 
         with (
-            mock.patch(
-                "gain_glm.evaluation.fit_state", side_effect=capture_fit_state
-            ),
+            mock.patch("gain_glm.evaluation.fit_state", side_effect=capture_fit_state),
             mock.patch(
                 "gain_glm.evaluation.refit_gains", wraps=original_refit_gains
             ) as refit_gains,
@@ -660,6 +659,129 @@ class EvaluationTests(unittest.TestCase):
             dropouts=[Dropout.gain("context", refit="full")],
         )
         self.assertEqual(result.dropouts["context"].dropout.refit, "full")
+
+    def test_circular_shift_tests_gain_term_and_trial_constant_predictor(self):
+        from gain_glm import evaluation
+
+        rng = np.random.default_rng(41)
+        block_size = 4
+        n_trials = 6 * block_size
+        trial_index = np.repeat(np.arange(n_trials), 6)
+        context = np.tile(
+            np.concatenate([np.full(block_size, -1.0), np.full(block_size, 1.0)]),
+            3,
+        )
+        x = rng.normal(size=trial_index.size)
+        target = (
+            0.2
+            + (1.0 + context[trial_index]) * x
+            + 0.7 * context[trial_index]
+            + rng.normal(0, 0.08, trial_index.size)
+        )
+        data = ModelData(
+            dt=0.1,
+            trial_index=trial_index,
+            signals={"x": x, "context_baseline": context[trial_index]},
+            trial_values={"context": context},
+            cv_groups=np.repeat(np.arange(6), block_size),
+        )
+        spec = ModelSpec(
+            predictors=(
+                Signal(
+                    "x",
+                    window=(0, 0),
+                    n_basis=1,
+                    gains=("context",),
+                ),
+                Signal("context_baseline", window=(0, 0), n_basis=1),
+            ),
+            gains=(Gain("context"),),
+            dt=0.1,
+            dropouts=(
+                Dropout.gain_terms("context", "x", permutation_test=True),
+                Dropout.predictors("context_baseline", permutation_test=True),
+            ),
+        )
+        prepared = compile_design(spec, data)
+        with (
+            mock.patch(
+                "gain_glm.evaluation.fit_state", wraps=evaluation.fit_state
+            ) as fit_state,
+            mock.patch(
+                "gain_glm.evaluation._fit_gain_coefficients",
+                wraps=evaluation._fit_gain_coefficients,
+            ) as fit_shifted_gains,
+            mock.patch(
+                "gain_glm.evaluation.refit_kernels",
+                wraps=evaluation.refit_kernels,
+            ) as fit_shifted_kernels,
+        ):
+            result = prepared.evaluate(
+                target,
+                fit=FitConfig(
+                    kernel_alpha=1e-5,
+                    gain_alpha=1e-5,
+                    max_iter=30,
+                ),
+                cv=CVConfig(),
+            )
+
+        # Per fold: one ordinary full fit, one ordinary reduced predictor fit,
+        # and one permutation-specific reduced fit for each test. The latter
+        # two use the common non-wrapping support. Shifts still use only one
+        # linear subproblem rather than an alternating fit.
+        self.assertEqual(fit_state.call_count, 24)
+        self.assertEqual(fit_shifted_gains.call_count, 24)
+        self.assertEqual(fit_shifted_kernels.call_count, 24)
+
+        for name, kind in (
+            ("context:x", "gain"),
+            ("context_baseline", "predictor"),
+        ):
+            permutation = result.dropouts[name].permutation
+            self.assertIsNotNone(permutation)
+            self.assertEqual(permutation.kind, kind)
+            np.testing.assert_array_equal(permutation.shifts, [0, 1, 2, -1])
+            np.testing.assert_array_equal(permutation.eligible_trials, np.arange(24))
+            np.testing.assert_array_equal(permutation.valid_trials, np.arange(2, 23))
+            np.testing.assert_array_equal(permutation.omitted_trials, [0, 1, 23])
+            self.assertEqual(permutation.delta_r2_per_shift_per_fold.shape, (4, 6))
+            self.assertEqual(permutation.delta_r2_pooled_per_shift.shape, (4,))
+            self.assertEqual(permutation.p_value, 0.25)
+            self.assertGreater(
+                permutation.observed_delta_r2_pooled,
+                np.max(permutation.delta_r2_pooled_per_shift[1:]),
+            )
+
+        summary = result.to_dict()["dropouts"]["context:x"]
+        self.assertTrue(summary["permutation_test"])
+        self.assertEqual(summary["permutation"]["n_unique_shifts"], 4)
+        self.assertEqual(summary["permutation"]["p_value"], 0.25)
+        np.testing.assert_array_equal(
+            summary["permutation"]["valid_trials"], np.arange(2, 23)
+        )
+        np.testing.assert_array_equal(
+            summary["permutation"]["omitted_trials"], [0, 1, 23]
+        )
+
+    def test_signed_shifts_balance_the_common_nonwrapping_window(self):
+        from gain_glm.evaluation import (
+            _common_nonwrapping_trials,
+            _unique_signed_circular_shifts,
+        )
+
+        block_size = 10
+        context = np.tile(
+            np.concatenate([np.full(block_size, -1.0), np.full(block_size, 1.0)]),
+            3,
+        )
+        shifts = _unique_signed_circular_shifts(context)
+        np.testing.assert_array_equal(
+            shifts,
+            [0, 1, 2, 3, 4, 5, -4, -3, -2, -1],
+        )
+        valid = _common_nonwrapping_trials(np.arange(context.size), shifts)
+        np.testing.assert_array_equal(valid, np.arange(5, 56))
 
     def test_evaluation_is_reproducible_and_result_is_typed(self):
         kwargs = {
