@@ -335,37 +335,38 @@ class _PermutationPlan:
     predictor: str | None = None
 
 
-def _unique_signed_circular_shifts(values: np.ndarray) -> np.ndarray:
-    """Return minimal signed shifts unique up to periodicity and global sign."""
+def _edge_block_shifts(values: np.ndarray) -> np.ndarray:
+    """Return lags supported by half of each contiguous edge-value block.
+
+    Positive ``np.roll`` shifts consume support at the beginning of the trial
+    sequence, so their limit comes from the first block. Negative shifts
+    consume support at the end and use the last block's limit. Shift zero is
+    kept first as the observed alignment.
+    """
     trial_values = np.asarray(values, dtype=float).ravel()
     if trial_values.size < 2:
         raise ValueError("a permutation test requires at least two selected trials")
-    representatives: dict[bytes, int] = {}
-    for shift in range(trial_values.size):
-        candidate = np.ascontiguousarray(np.roll(trial_values, shift))
-        candidate[candidate == 0] = 0.0
-        negative = np.ascontiguousarray(-candidate)
-        negative[negative == 0] = 0.0
-        key = min(candidate.tobytes(), negative.tobytes())
-        signed_shift = (
-            shift if shift <= trial_values.size // 2 else shift - trial_values.size
-        )
-        current = representatives.get(key)
-        # Prefer the shortest representative, breaking an exact +/- tie in
-        # favor of the positive lag. Dict insertion order keeps shift zero at
-        # index zero, which is part of the public result contract.
-        if current is None or (abs(signed_shift), signed_shift < 0) < (
-            abs(current),
-            current < 0,
-        ):
-            representatives[key] = signed_shift
-    shifts = list(representatives.values())
-    if len(shifts) < 2:
+
+    first_change = np.flatnonzero(~np.isclose(trial_values, trial_values[0]))
+    if first_change.size == 0:
+        raise ValueError("a permutation test requires at least two trial-value blocks")
+    first_block_length = int(first_change[0])
+
+    last_change = np.flatnonzero(~np.isclose(trial_values, trial_values[-1]))
+    last_block_length = trial_values.size - int(last_change[-1]) - 1
+
+    max_positive = first_block_length // 2
+    max_negative = last_block_length // 2
+    if max_positive + max_negative == 0:
         raise ValueError(
-            "permutation test has no nonzero circular shift after sign and "
-            "periodicity equivalence"
+            "permutation test edge blocks are too short for a nonzero shift"
         )
-    return np.asarray(shifts, dtype=int)
+    return np.concatenate(
+        (
+            np.arange(max_positive + 1, dtype=int),
+            np.arange(-max_negative, 0, dtype=int),
+        )
+    )
 
 
 def _common_nonwrapping_trials(
@@ -377,8 +378,8 @@ def _common_nonwrapping_trials(
     valid_trials = active_trials[first:stop]
     if valid_trials.size < 2:
         raise ValueError(
-            "permutation test has fewer than two common non-wrapping trials; "
-            "the gain sequence does not repeat often enough for its shift set"
+            "permutation test has fewer than two trials in its common "
+            "edge-trimmed window"
         )
     return valid_trials
 
@@ -442,7 +443,7 @@ def _permutation_plan(
                     "constant within every selected trial"
                 )
             active_values[index] = values[0]
-        shifts = _unique_signed_circular_shifts(active_values)
+        shifts = _edge_block_shifts(active_values)
         valid_trials = _common_nonwrapping_trials(active_trials, shifts)
         shifted = np.zeros((shifts.size, n_trials))
         for index, shift in enumerate(shifts):
@@ -462,7 +463,7 @@ def _permutation_plan(
         prepared.data.trial_values[gain_spec.source], dtype=float
     )[:n_trials]
     active_values = source_values[active_trials]
-    shifts = _unique_signed_circular_shifts(active_values)
+    shifts = _edge_block_shifts(active_values)
     valid_trials = _common_nonwrapping_trials(active_trials, shifts)
     shifted = np.tile(source_values, (shifts.size, 1))
     for index, shift in enumerate(shifts):

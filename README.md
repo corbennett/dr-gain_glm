@@ -168,29 +168,31 @@ and every iterative reduced-model fold; the legacy top-level `converged` field
 continues to describe only the final all-data fit.
 
 Set `permutation_test=True` on a gain-only dropout to additionally run a
-trial-level circular-shift test. For each outer fold, the reduced model is fit
+restricted trial-level shift test. For each outer fold, the reduced model is fit
 without the requested gain coefficients. Its kernels are then frozen, and all
 gain coefficients are fit once for each shifted version of the requested
 gain's trial values. Only the gain terms selected by that dropout receive the
 shifted values; all other gain and predictor inputs retain their observed
 alignment.
 
-The shift set includes shift zero and removes assignments duplicated by the
-gain sequence's circular periodicity or by a global sign flip. Each class uses
-the shortest signed lag, with a positive lag used for an exact tie. The test
-then uses one common trial window on which none of those lags wraps around the
-start or end of the session. This window is used for both the
+The shift set includes shift zero, positive lags through half the first
+eligible value block, and negative lags through half the last eligible value
+block. With NumPy's roll convention, positive lags consume the first block's
+left-edge support and negative lags consume the last block's right-edge
+support. Edge blocks are measured after applying the evaluation mask. The test
+removes those half-block edge windows so every lag is scored on the same
+non-wrapping trials. This common window is used for both the
 permutation-specific reduced fit and every shifted fit and held-out score; the
 ordinary CV and dropout metrics still use the original evaluation mask.
 `PermutationTestResult.valid_trials` and `omitted_trials` expose the exact
 support.
 
 For example, an exactly alternating schedule with 10 trials per block has the
-10 representatives `[-4, -3, -2, -1, 0, 1, 2, 3, 4, 5]` (the result stores
-zero first). The shared window omits the first 5 and last 4 eligible trials, so
-a six-block session evaluates trials 6 through 56 in one-based numbering. The
-reported one-sided p-value is the fraction of pooled held-out delta-R2 values
-at least as large as the shift-zero value.
+11 shifts `[0, 1, 2, 3, 4, 5, -5, -4, -3, -2, -1]`. The shared window omits
+the first and last 5 eligible trials, so a six-block session evaluates trials
+6 through 55 in one-based numbering. The reported one-sided p-value is the
+fraction of pooled held-out delta-R2 values at least as large as the shift-zero
+value.
 
 A one-column predictor that is constant within each trial can also request the
 test, as in `Dropout.predictors("context_baseline", permutation_test=True)`.

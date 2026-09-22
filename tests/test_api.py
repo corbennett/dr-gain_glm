@@ -660,7 +660,7 @@ class EvaluationTests(unittest.TestCase):
         )
         self.assertEqual(result.dropouts["context"].dropout.refit, "full")
 
-    def test_circular_shift_tests_gain_term_and_trial_constant_predictor(self):
+    def test_restricted_shift_tests_gain_term_and_trial_constant_predictor(self):
         from gain_glm import evaluation
 
         rng = np.random.default_rng(41)
@@ -731,8 +731,8 @@ class EvaluationTests(unittest.TestCase):
         # two use the common non-wrapping support. Shifts still use only one
         # linear subproblem rather than an alternating fit.
         self.assertEqual(fit_state.call_count, 24)
-        self.assertEqual(fit_shifted_gains.call_count, 24)
-        self.assertEqual(fit_shifted_kernels.call_count, 24)
+        self.assertEqual(fit_shifted_gains.call_count, 30)
+        self.assertEqual(fit_shifted_kernels.call_count, 30)
 
         for name, kind in (
             ("context:x", "gain"),
@@ -741,13 +741,13 @@ class EvaluationTests(unittest.TestCase):
             permutation = result.dropouts[name].permutation
             self.assertIsNotNone(permutation)
             self.assertEqual(permutation.kind, kind)
-            np.testing.assert_array_equal(permutation.shifts, [0, 1, 2, -1])
+            np.testing.assert_array_equal(permutation.shifts, [0, 1, 2, -2, -1])
             np.testing.assert_array_equal(permutation.eligible_trials, np.arange(24))
-            np.testing.assert_array_equal(permutation.valid_trials, np.arange(2, 23))
-            np.testing.assert_array_equal(permutation.omitted_trials, [0, 1, 23])
-            self.assertEqual(permutation.delta_r2_per_shift_per_fold.shape, (4, 6))
-            self.assertEqual(permutation.delta_r2_pooled_per_shift.shape, (4,))
-            self.assertEqual(permutation.p_value, 0.25)
+            np.testing.assert_array_equal(permutation.valid_trials, np.arange(2, 22))
+            np.testing.assert_array_equal(permutation.omitted_trials, [0, 1, 22, 23])
+            self.assertEqual(permutation.delta_r2_per_shift_per_fold.shape, (5, 6))
+            self.assertEqual(permutation.delta_r2_pooled_per_shift.shape, (5,))
+            self.assertEqual(permutation.p_value, 0.2)
             self.assertGreater(
                 permutation.observed_delta_r2_pooled,
                 np.max(permutation.delta_r2_pooled_per_shift[1:]),
@@ -755,19 +755,19 @@ class EvaluationTests(unittest.TestCase):
 
         summary = result.to_dict()["dropouts"]["context:x"]
         self.assertTrue(summary["permutation_test"])
-        self.assertEqual(summary["permutation"]["n_unique_shifts"], 4)
-        self.assertEqual(summary["permutation"]["p_value"], 0.25)
+        self.assertEqual(summary["permutation"]["n_unique_shifts"], 5)
+        self.assertEqual(summary["permutation"]["p_value"], 0.2)
         np.testing.assert_array_equal(
-            summary["permutation"]["valid_trials"], np.arange(2, 23)
+            summary["permutation"]["valid_trials"], np.arange(2, 22)
         )
         np.testing.assert_array_equal(
-            summary["permutation"]["omitted_trials"], [0, 1, 23]
+            summary["permutation"]["omitted_trials"], [0, 1, 22, 23]
         )
 
-    def test_signed_shifts_balance_the_common_nonwrapping_window(self):
+    def test_edge_block_shifts_define_the_common_nonwrapping_window(self):
         from gain_glm.evaluation import (
             _common_nonwrapping_trials,
-            _unique_signed_circular_shifts,
+            _edge_block_shifts,
         )
 
         block_size = 10
@@ -775,13 +775,35 @@ class EvaluationTests(unittest.TestCase):
             np.concatenate([np.full(block_size, -1.0), np.full(block_size, 1.0)]),
             3,
         )
-        shifts = _unique_signed_circular_shifts(context)
+        shifts = _edge_block_shifts(context)
         np.testing.assert_array_equal(
             shifts,
-            [0, 1, 2, 3, 4, 5, -4, -3, -2, -1],
+            [0, 1, 2, 3, 4, 5, -5, -4, -3, -2, -1],
         )
         valid = _common_nonwrapping_trials(np.arange(context.size), shifts)
-        np.testing.assert_array_equal(valid, np.arange(5, 56))
+        np.testing.assert_array_equal(valid, np.arange(5, 55))
+
+    def test_edge_block_shifts_support_irregular_context_blocks(self):
+        from gain_glm.evaluation import (
+            _common_nonwrapping_trials,
+            _edge_block_shifts,
+        )
+
+        block_lengths = [81, 81, 80, 74, 68, 74]
+        context = np.concatenate(
+            [
+                np.full(length, -1.0 if index % 2 == 0 else 1.0)
+                for index, length in enumerate(block_lengths)
+            ]
+        )
+
+        shifts = _edge_block_shifts(context)
+        np.testing.assert_array_equal(
+            shifts,
+            np.concatenate((np.arange(41), np.arange(-37, 0))),
+        )
+        valid = _common_nonwrapping_trials(np.arange(context.size), shifts)
+        np.testing.assert_array_equal(valid, np.arange(40, 421))
 
     def test_evaluation_is_reproducible_and_result_is_typed(self):
         kwargs = {
