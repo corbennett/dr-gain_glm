@@ -475,6 +475,46 @@ while supplying an integer reproducibly randomizes whole trials among folds.
 Instruction trials are excluded by default; add `--use-instruction-trials` to
 include them.
 
+Unit selection defaults to the boolean `default_qc` column. Use `qc_column=`
+in Python or `--qc-column` on the command line to select another boolean column.
+To combine criteria across columns, pass `qc_filter` to `qc_unit_ids`,
+`fit_session`, or `compare_models`:
+
+```python
+import polars as pl
+from gain_glm.dynamic_routing import qc_unit_ids
+
+unit_ids = qc_unit_ids(
+    nwb_path,
+    qc_filter=(
+        (pl.col("amplitude_cutoff") <= 0.1)
+        & (pl.col("isi_violations_ratio") <= 0.5)
+        & (pl.col("presence_ratio") >= 0.7)
+        & (pl.col("activity_drift") <= 0.2)
+    ),
+)
+```
+
+`qc_filter` also accepts a SQL expression string. The same syntax is available
+as `--qc-filter` in `gain-glm-fit`, `scripts/compare_models.py`, and
+`scripts/submit_slurm.py`, for example:
+
+```bash
+gain-glm-fit \
+  --nwb-path s3://path/session.nwb \
+  --session-id 668755_2023-08-31 \
+  --output-dir results-custom-qc \
+  --qc-filter 'amplitude_cutoff <= 0.1 AND isi_violations_ratio <= 0.5 AND presence_ratio >= 0.7 AND activity_drift <= 0.2'
+```
+
+A custom filter **replaces** the boolean QC column check; include `default_qc`
+in the expression if both are required. Expressions can also use OR conditions
+and parentheses. Units labeled `noise` are still excluded, and null filter
+results do not pass. Filtering happens before the unit limit. Explicit
+`unit_ids` in `compare_models` bypass QC selection. Existing session outputs
+are skipped unless `--overwrite` is supplied, so use a new output directory
+or overwrite when changing QC criteria.
+
 The session result JSON includes `runtime_seconds`, recording the total elapsed
 wall-clock time for the session fit.
 

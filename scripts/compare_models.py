@@ -6,7 +6,12 @@ from dataclasses import replace as dataclass_replace
 import polars.selectors as cs
 
 from gain_glm import CVConfig, FitConfig
-from gain_glm.batch import compare_models, parse_dropout, parse_positive_float
+from gain_glm.batch import (
+    add_qc_arguments,
+    compare_models,
+    parse_dropout,
+    parse_positive_float,
+)
 from gain_glm.dynamic_routing import MODELS
 
 
@@ -18,6 +23,7 @@ def main() -> None:
     )
     parser.add_argument("--unit", action="append", dest="units")
     parser.add_argument("--unit-limit", type=int, default=8)
+    add_qc_arguments(parser)
     parser.add_argument("--dropout", action="append", type=parse_dropout)
     parser.add_argument(
         "--cv-split",
@@ -48,6 +54,8 @@ def main() -> None:
         models,
         unit_ids=args.units,
         unit_limit=args.unit_limit,
+        qc_column=args.qc_column,
+        qc_filter=args.qc_filter,
         dropouts=args.dropout,
         fit=FitConfig(max_iter=args.max_iter),
         cv=CVConfig(

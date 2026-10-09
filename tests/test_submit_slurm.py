@@ -1,5 +1,6 @@
 import argparse
 import json
+import shlex
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +14,31 @@ from scripts.submit_slurm import (
 
 
 class SubmitSlurmTests(unittest.TestCase):
+    def test_fit_command_quotes_and_forwards_qc_filter(self):
+        predicate = "amplitude_cutoff <= 0.1 AND decoder_label = 'good'"
+        command = fit_command(
+            "session.nwb",
+            "session",
+            Path("results"),
+            model="default",
+            max_iter=50,
+            qc_filter=predicate,
+        )
+        arguments = shlex.split(command)
+        self.assertEqual(arguments[arguments.index("--qc-filter") + 1], predicate)
+        self.assertNotIn("--qc-column", arguments)
+
+    def test_fit_command_forwards_custom_qc_column(self):
+        command = fit_command(
+            "session.nwb",
+            "session",
+            Path("results"),
+            model="default",
+            max_iter=50,
+            qc_column="custom_qc",
+        )
+        self.assertIn("--qc-column custom_qc", command)
+
     def test_resolve_output_dir_accepts_explicit_path(self):
         self.assertEqual(
             resolve_output_dir("results/experiment-a"), Path("results/experiment-a")

@@ -42,13 +42,14 @@ OUTCOME_EVENTS = (
 
 
 def _stimulus_predictors(
-    *, window: tuple[float, float] = (0, 0.1), n_basis: int = 2
+    *, window: tuple[float, float] = (0, 0.1), n_basis: int = 4, basis: str = 'identity'
 ) -> tuple[Event, ...]:
     return tuple(
         Event(
             name,
             window=window,
             n_basis=n_basis,
+            basis=basis,
             gains=("context",),
             groups=("stimulus", "task"),
         )
@@ -230,7 +231,7 @@ DEFAULT_MODEL = ModelSpec(
 NO_FACE_MODEL = DEFAULT_MODEL.without_group("face", name="no_face")
 
 NO_HIT_LONG_STIM_MODEL = ModelSpec(
-    predictors=(*_stimulus_predictors(window=(0, 1), n_basis=10), *BEHAVIOR_PREDICTORS),
+    predictors=(*_stimulus_predictors(window=(0, 1), n_basis=10, basis="cosine"), *BEHAVIOR_PREDICTORS),
     gains=DEFAULT_MODEL.gains,
     name="no_hit_long_stim",
     dt=DEFAULT_DT,
@@ -766,10 +767,32 @@ def prepare(
     )
 
 
-def qc_unit_ids(nwb_path: str, *, qc_column: str = QC_COLUMN) -> list[str]:
+def qc_unit_ids(
+    nwb_path: str,
+    *,
+    qc_column: str = QC_COLUMN,
+    qc_filter: pl.Expr | str | None = None,
+) -> list[str]:
+    """Select non-noise units passing a boolean column or a custom filter.
+
+    ``qc_filter`` replaces the ``qc_column`` check when supplied. It accepts
+    a Polars boolean expression or SQL expression string, such as
+    ``"amplitude_cutoff <= 0.1 AND presence_ratio >= 0.7"``. Include the QC
+    column in the expression to require both. Null filter results are excluded.
+    """
+    if qc_filter is None:
+        predicate = pl.col(qc_column)
+    elif isinstance(qc_filter, str):
+        predicate = pl.sql_expr(qc_filter)
+    elif isinstance(qc_filter, pl.Expr):
+        predicate = qc_filter
+    else:
+        raise TypeError(
+            "qc_filter must be a Polars expression or SQL expression string"
+        )
     return (
         lazynwb.scan_nwb(nwb_path, "/units")
-        .filter(pl.col(qc_column) & (pl.col("decoder_label") != "noise"))
+        .filter(predicate & (pl.col("decoder_label") != "noise"))
         .select("unit_id")
         .collect()["unit_id"]
         .to_list()

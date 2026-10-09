@@ -6,6 +6,7 @@ block below. Use ``--dry-run`` to inspect commands before submission.
 
 import argparse
 import json
+import shlex
 from dataclasses import asdict
 from dataclasses import replace as dataclass_replace
 from datetime import datetime
@@ -16,8 +17,8 @@ from dr_datacube import datacube_config, get_session_ids_from_github, list_nwb_s
 from simple_slurm import Slurm
 
 from gain_glm import FitConfig
-from gain_glm.batch import parse_positive_float
-from gain_glm.dynamic_routing import MODELS
+from gain_glm.batch import add_qc_arguments, parse_positive_float
+from gain_glm.dynamic_routing import MODELS, QC_COLUMN
 
 REPO_DIR = Path(__file__).resolve().parents[1]
 PYTHON = str(REPO_DIR / ".venv/bin/python")
@@ -90,6 +91,8 @@ def fit_command(
     fold_seed: int | None = None,
     dt: float | None = None,
     unit_limit: int | None = None,
+    qc_column: str = QC_COLUMN,
+    qc_filter: str | None = None,
     use_instruction_trials: bool = False,
     overwrite: bool = False,
 ) -> str:
@@ -110,6 +113,10 @@ def fit_command(
         command += f" --dt {dt}"
     if unit_limit is not None:
         command += f" --limit {unit_limit}"
+    if qc_filter is not None:
+        command += f" --qc-filter {shlex.quote(qc_filter)}"
+    else:
+        command += f" --qc-column {shlex.quote(qc_column)}"
     if use_instruction_trials:
         command += " --use-instruction-trials"
     if overwrite:
@@ -142,6 +149,7 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--unit-limit", type=int)
+    add_qc_arguments(parser)
     parser.add_argument("--model", choices=MODELS, default="default")
     parser.add_argument(
         "--cv-split",
@@ -192,6 +200,8 @@ def main() -> None:
             fold_seed=args.fold_seed,
             dt=args.dt,
             unit_limit=args.unit_limit,
+            qc_column=args.qc_column,
+            qc_filter=args.qc_filter,
             use_instruction_trials=args.use_instruction_trials,
             overwrite=args.overwrite,
         )

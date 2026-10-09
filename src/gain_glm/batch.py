@@ -62,10 +62,11 @@ def fit_session(
     n_jobs: int = -1,
     limit: int | None = None,
     qc_column: str = QC_COLUMN,
+    qc_filter: pl.Expr | str | None = None,
     use_instruction_trials: bool = False,
     overwrite: bool = False,
 ) -> Path:
-    """Fit every selected unit while reusing one prepared session design."""
+    """Fit selected units, using ``qc_filter`` in place of ``qc_column`` if given."""
     output_path = Path(output_dir) / f"{session_id}.json"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists() and not overwrite:
@@ -73,7 +74,7 @@ def fit_session(
         return output_path
 
     started = time.perf_counter()
-    units = qc_unit_ids(nwb_path, qc_column=qc_column)
+    units = qc_unit_ids(nwb_path, qc_column=qc_column, qc_filter=qc_filter)
     if limit is not None:
         units = units[:limit]
     session = load_session(
@@ -117,9 +118,11 @@ def compare_models(
     fit: FitConfig | None = None,
     cv: CVConfig | None = None,
     unit_limit: int = 8,
+    qc_column: str = QC_COLUMN,
+    qc_filter: pl.Expr | str | None = None,
     use_instruction_trials: bool = False,
 ) -> pl.DataFrame:
-    """Compare full-model variants using one session load and target cache."""
+    """Compare models with shared data; explicit ``unit_ids`` bypass QC selection."""
     if not models:
         raise ValueError("at least one model is required")
     reference = models[0]
@@ -140,7 +143,11 @@ def compare_models(
     if len(prepared) != len(models):
         raise ValueError("model names must be unique")
     units = (
-        list(unit_ids) if unit_ids is not None else qc_unit_ids(nwb_path)[:unit_limit]
+        list(unit_ids)
+        if unit_ids is not None
+        else qc_unit_ids(nwb_path, qc_column=qc_column, qc_filter=qc_filter)[
+            :unit_limit
+        ]
     )
     targets = {unit: load_unit_target(session, unit) for unit in units}
     fit_config = FitConfig() if fit is None else fit
@@ -204,6 +211,30 @@ def parse_positive_float(value: str) -> float:
     return parsed
 
 
+def parse_qc_filter(value: str) -> str:
+    """Validate SQL expression syntax while retaining text for job submission."""
+    try:
+        pl.sql_expr(value)
+    except pl.exceptions.PolarsError as error:
+        raise argparse.ArgumentTypeError(f"invalid QC filter: {error}") from error
+    return value
+
+
+def add_qc_arguments(parser: argparse.ArgumentParser) -> None:
+    """Expose the same alternative QC selectors on each workflow CLI."""
+    qc_options = parser.add_mutually_exclusive_group()
+    qc_options.add_argument(
+        "--qc-column",
+        default=QC_COLUMN,
+        help=f"Boolean unit QC column (default: {QC_COLUMN})",
+    )
+    qc_options.add_argument(
+        "--qc-filter",
+        type=parse_qc_filter,
+        help="SQL boolean expression replacing the QC column check; noise is excluded",
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--nwb-path", required=True)
@@ -246,7 +277,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     parser.add_argument("--n-jobs", type=int, default=-1)
     parser.add_argument("--limit", type=int)
-    parser.add_argument("--qc-column", default=QC_COLUMN)
+    add_qc_arguments(parser)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args(argv)
     model = MODELS[args.model]
@@ -267,6 +298,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         n_jobs=args.n_jobs,
         limit=args.limit,
         qc_column=args.qc_column,
+        qc_filter=args.qc_filter,
         use_instruction_trials=args.use_instruction_trials,
         overwrite=args.overwrite,
     )

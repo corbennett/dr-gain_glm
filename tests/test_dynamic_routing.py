@@ -17,7 +17,82 @@ from gain_glm.dynamic_routing import (
     load_session,
     load_unit_target,
     prepare,
+    qc_unit_ids,
 )
+
+
+class UnitQCTests(unittest.TestCase):
+    def setUp(self):
+        passing = {
+            "unit_id": "boundary",
+            "default_qc": False,
+            "custom_qc": True,
+            "decoder_label": "good",
+            "amplitude_cutoff": 0.1,
+            "isi_violations_ratio": 0.5,
+            "presence_ratio": 0.7,
+            "activity_drift": 0.2,
+        }
+        rows = [passing, dict(passing, unit_id="default", default_qc=True)]
+        for column, value in (
+            ("amplitude_cutoff", 0.11),
+            ("isi_violations_ratio", 0.51),
+            ("presence_ratio", 0.69),
+            ("activity_drift", 0.21),
+            ("activity_drift", None),
+            ("decoder_label", "noise"),
+        ):
+            rows.append(dict(passing, unit_id=str(len(rows)), **{column: value}))
+        self.units = pl.DataFrame(rows)
+        self.sql = (
+            "amplitude_cutoff <= 0.1 AND isi_violations_ratio <= 0.5 "
+            "AND presence_ratio >= 0.7 AND activity_drift <= 0.2"
+        )
+
+    def select(self, **kwargs):
+        with mock.patch(
+            "gain_glm.dynamic_routing.lazynwb.scan_nwb",
+            return_value=self.units.lazy(),
+        ) as scan:
+            result = qc_unit_ids("fake.nwb", **kwargs)
+        scan.assert_called_once_with("fake.nwb", "/units")
+        return result
+
+    def test_default_and_custom_boolean_columns(self):
+        self.assertEqual(self.select(), ["default"])
+        self.assertEqual(
+            self.select(qc_column="custom_qc"),
+            self.units.filter(pl.col("decoder_label") != "noise")["unit_id"].to_list(),
+        )
+
+    def test_combined_thresholds_replace_default_column(self):
+        expression = (
+            (pl.col("amplitude_cutoff") <= 0.1)
+            & (pl.col("isi_violations_ratio") <= 0.5)
+            & (pl.col("presence_ratio") >= 0.7)
+            & (pl.col("activity_drift") <= 0.2)
+        )
+        # Custom criteria must also work on a table without the default column.
+        self.units = self.units.drop("default_qc")
+        for predicate in (expression, self.sql):
+            with self.subTest(predicate=str(predicate)):
+                self.assertEqual(
+                    self.select(qc_filter=predicate), ["boundary", "default"]
+                )
+
+    def test_filter_can_include_boolean_column_and_or_conditions(self):
+        self.assertEqual(
+            self.select(qc_filter=f"default_qc AND ({self.sql})"), ["default"]
+        )
+        self.assertEqual(
+            self.select(qc_filter="default_qc OR unit_id = 'boundary'"),
+            ["boundary", "default"],
+        )
+
+    def test_no_matches_and_missing_columns(self):
+        self.assertEqual(self.select(qc_filter="amplitude_cutoff < 0"), [])
+        with self.assertRaises(pl.exceptions.ColumnNotFoundError):
+            self.select(qc_filter="missing_metric < 0.1")
 
 
 class DynamicRoutingAdapterTests(unittest.TestCase):
