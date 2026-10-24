@@ -1,5 +1,14 @@
 # gain-glm
 
+For area-by-area analyses of modality preference, baseline context preference,
+target preference, expert/naive comparisons, and spatial segregation, see the
+[context preference analysis guide](analyses/context_preferences/README.md).
+For the independent responsive-cell analysis comparing modality and target
+preference, see the [responsive preference analysis guide](analyses/responsive_preferences/README.md).
+For whether modality-preferring cells encode baseline context more often than
+target/nontarget-preferring cells, see the
+[preference–context association guide](analyses/preference_context/README.md).
+
 `gain-glm` fits bilinear encoding models whose temporal kernels can be scaled
 by trial-level variables such as context, value, attention, or arousal.
 
