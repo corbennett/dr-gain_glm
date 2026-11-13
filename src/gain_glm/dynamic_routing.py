@@ -65,8 +65,8 @@ def _late_stimulus_predictors() -> tuple[Event, ...]:
         Event(
             name,
             source=source,
-            window=(0.1, 1),
-            n_basis=5,
+            window=(0.1, 0.5), #changed from (0.1, 1) to (0.1, 0.5) to match shailaja's RNN analysis
+            n_basis=4,
             gains=("context",),
             groups=("stimulus", "late_stimulus", "task"),
         )
