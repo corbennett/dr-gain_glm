@@ -153,6 +153,86 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(options["model"].dt, 0.05)
         self.assertTrue(options["use_instruction_trials"])
 
+    def test_cli_forwards_null_options(self):
+        base = [
+            "--nwb-path",
+            "session.nwb",
+            "--session-id",
+            "session",
+            "--output-dir",
+            "results",
+        ]
+        with mock.patch("gain_glm.batch.fit_session") as fit_session:
+            main(base)
+        self.assertEqual(fit_session.call_args.kwargs["null"], "shift")
+        with mock.patch("gain_glm.batch.fit_session") as fit_session:
+            main(
+                [
+                    *base,
+                    "--null",
+                    "random-blocks",
+                    "--n-null",
+                    "500",
+                    "--min-block-duration",
+                    "240",
+                    "--null-seed",
+                    "9",
+                ]
+            )
+        options = fit_session.call_args.kwargs
+        self.assertEqual(options["null"], "random-blocks")
+        self.assertEqual(options["n_null"], 500)
+        self.assertEqual(options["min_block_duration"], 240.0)
+        self.assertEqual(options["null_seed"], 9)
+
+    def test_fit_session_random_block_null_is_shared_and_recorded(self):
+        import zlib
+
+        from gain_glm import NullConfig
+
+        null = NullConfig(method="labels", labels=np.ones((2, 3)))
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch("gain_glm.batch.qc_unit_ids", return_value=["a", "b"]),
+            mock.patch("gain_glm.batch.load_session") as load,
+            mock.patch("gain_glm.batch.prepare"),
+            mock.patch("gain_glm.batch.load_unit_target"),
+            mock.patch("gain_glm.batch.random_block_null", return_value=null) as make,
+            mock.patch(
+                "gain_glm.batch._evaluate_unit", side_effect=lambda unit, *a: (unit, {})
+            ) as evaluate_unit,
+        ):
+            path = fit_session(
+                "session.nwb",
+                "session",
+                directory,
+                n_jobs=1,
+                null="random-blocks",
+                n_null=50,
+                min_block_duration=200.0,
+            )
+            payload = json.loads(path.read_text())
+        seed = zlib.crc32(b"session")
+        make.assert_called_once_with(
+            load.return_value, 50, min_block_duration=200.0, seed=seed
+        )
+        self.assertEqual(
+            [call.args[-1] for call in evaluate_unit.call_args_list], [null, null]
+        )
+        self.assertEqual(
+            payload["null"],
+            {
+                "method": "random-blocks",
+                "n_null": 50,
+                "min_block_duration": 200.0,
+                "seed": seed,
+            },
+        )
+
+    def test_fit_session_rejects_unknown_null(self):
+        with self.assertRaisesRegex(ValueError, "null must be one of"):
+            fit_session("session.nwb", "session", "results", null="labels")
+
     def test_prepared_design_is_process_serializable(self):
         trial_index = np.repeat(np.arange(3), 4)
         data = ModelData(

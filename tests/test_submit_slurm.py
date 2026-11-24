@@ -94,6 +94,33 @@ class SubmitSlurmTests(unittest.TestCase):
         self.assertNotIn("--dt", command)
         self.assertNotIn("--use-instruction-trials", command)
 
+    def test_fit_command_forwards_random_block_null(self):
+        command = fit_command(
+            "session.nwb",
+            "session",
+            Path("results"),
+            model="default",
+            max_iter=50,
+            null="random-blocks",
+            n_null=500,
+            min_block_duration=240.0,
+            null_seed=3,
+        )
+        arguments = shlex.split(command)
+        self.assertEqual(arguments[arguments.index("--null") + 1], "random-blocks")
+        self.assertEqual(arguments[arguments.index("--n-null") + 1], "500")
+        self.assertEqual(
+            arguments[arguments.index("--min-block-duration") + 1], "240.0"
+        )
+        self.assertEqual(arguments[arguments.index("--null-seed") + 1], "3")
+
+    def test_fit_command_omits_null_options_for_shift_null(self):
+        command = fit_command(
+            "session.nwb", "session", Path("results"), model="default", max_iter=50
+        )
+        for option in ("--null", "--n-null", "--min-block-duration", "--null-seed"):
+            self.assertNotIn(option, command)
+
     def test_run_params_record_overridden_dt_and_cv_options(self):
         args = argparse.Namespace(
             model="default",

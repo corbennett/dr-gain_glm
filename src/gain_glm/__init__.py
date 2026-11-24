@@ -15,6 +15,7 @@ from .evaluation import (
     CVResult,
     DropoutResult,
     EvaluationResult,
+    NullConfig,
     PermutationTestResult,
     evaluate,
 )
@@ -45,6 +46,7 @@ __all__ = [
     "History",
     "ModelData",
     "ModelSpec",
+    "NullConfig",
     "PermutationTestResult",
     "PreparedDesign",
     "ResolvedDropout",

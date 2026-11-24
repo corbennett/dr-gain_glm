@@ -210,6 +210,47 @@ the kernels are fit once at each shifted alignment. The ordinary dropout
 metrics remain the comparisons described below; permutation results are stored
 separately on `DropoutResult.permutation`.
 
+#### Random block-boundary null
+
+Neighbouring shifts are near copies of the observed alignment (a one-trial
+shift relabels only the trials next to each block switch), so the shift test
+has little power and its smallest possible p-value is `1 / n_shifts`. As an
+alternative, `evaluate` (and `PreparedDesign.evaluate`) accepts
+`null=NullConfig(method="labels", labels=...)`, an `(n_labels, n_trials)`
+array of pseudo trial values. Each label is scored exactly like a shifted
+alignment (same frozen reduced fit, same penalty, same folds), but on every
+eligible trial, because labels need no edge trimming. The p-value is
+`(1 + #{null >= observed}) / (1 + n_labels)`, and `PermutationTestResult`
+reports `method="labels"` with `shifts` holding label indices (0 = observed).
+When the subproblem is Ridge, all labels are solved at once from per-trial
+sufficient statistics, which is exact up to rounding and faster than the shift
+loop. Lasso kernels, or a kernel penalty that would need inner CV, fall back to
+one refit per label.
+
+For Dynamic Routing, `random_block_contexts(session, n_labels=1000,
+min_block_duration=300.0, seed=...)` draws alternating +1/-1 contexts with the
+observed number of blocks. Block durations are uniform over all splits of the
+task in which every block lasts at least `min_block_duration` seconds, and
+trials are assigned by start time. Use the same labels for every unit of a
+session; `random_block_null` wraps them in a `NullConfig`:
+
+```python
+null = random_block_null(session, 1000, min_block_duration=300.0, seed=0)
+result = prepared.evaluate(y, null=null)
+```
+
+From the command line (and `scripts/submit_slurm.py`), pass `--null
+random-blocks` with optional `--n-null`, `--min-block-duration` and
+`--null-seed`. The seed defaults to a hash of the session id, and the session
+JSON records the settings under `"null"`. To keep files small, serialized
+results for a labels null contain only the pooled null curve, not per-fold
+curves.
+
+Do not drop pseudo-contexts that happen to resemble the true schedule: under
+leave-one-block-out CV they are part of what keeps the test calibrated, and
+excluding them (for example keeping only labels with |r| < 0.5 to the true
+context) made the test anti-conservative on context-naive sessions.
+
 ### Current fitting procedure
 
 The implementation separates preparation, parameter fitting, and held-out

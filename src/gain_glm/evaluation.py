@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from ._label_null import gain_label_sse, predictor_label_sse
 from ._solver import (
     _fit_gain_coefficients,
     _gain_design,
@@ -48,6 +49,73 @@ class CVConfig:
             raise ValueError("CV split must be 'auto', 'groups', or 'trials'")
 
 
+NULL_METHODS = ("shift", "labels")
+
+
+@dataclass(frozen=True, eq=False)  # holds arrays: compare by identity
+class NullConfig:
+    """Choose the null distribution of dropouts with ``permutation_test=True``.
+
+    ``method="shift"`` (default) compares the observed alignment with
+    non-wrapping linear trial shifts on the common edge-trimmed trials.
+    ``method="labels"`` compares it with caller-supplied pseudo trial values,
+    for example contexts with randomly placed block boundaries from
+    :func:`gain_glm.dynamic_routing.random_block_contexts`, scored on every
+    eligible trial. ``labels`` is an ``(n_labels, n_trials)`` array used for
+    every permutation-tested dropout, or a mapping from gain name (gain
+    dropouts) or predictor name (predictor dropouts) to such an array. Label
+    values replace the trial values of the permuted gain source or the
+    trial-constant predictor, so they must use the same units (for example
+    +1/-1 context).
+    """
+
+    method: str = "shift"
+    labels: np.ndarray | Mapping[str, np.ndarray] | None = None
+
+    def __post_init__(self) -> None:
+        if self.method not in NULL_METHODS:
+            raise ValueError(f"null method must be one of {NULL_METHODS}")
+        if self.method == "shift":
+            if self.labels is not None:
+                raise ValueError("the shift null does not take labels")
+            return
+        if self.labels is None:
+            raise ValueError("the labels null requires labels")
+        if isinstance(self.labels, Mapping):
+            labels = {
+                str(name): _validated_labels(values, name)
+                for name, values in self.labels.items()
+            }
+            if not labels:
+                raise ValueError("labels mapping is empty")
+        else:
+            labels = _validated_labels(self.labels, "labels")
+        object.__setattr__(self, "labels", labels)
+
+    def labels_for(self, name: str, n_trials: int) -> np.ndarray:
+        """Return the label matrix used for gain or predictor ``name``."""
+        labels = self.labels
+        if isinstance(labels, Mapping):
+            if name not in labels:
+                raise ValueError(f"null labels have no entry for {name!r}")
+            labels = labels[name]
+        if labels.shape[1] != n_trials:
+            raise ValueError(
+                f"null labels have {labels.shape[1]} trials, expected {n_trials}"
+            )
+        return labels
+
+
+def _validated_labels(values, name) -> np.ndarray:
+    labels = np.array(values, dtype=float)
+    if labels.ndim != 2 or labels.shape[0] < 1:
+        raise ValueError(f"null labels {name!r} must have shape (n_labels, n_trials)")
+    if not np.all(np.isfinite(labels)):
+        raise ValueError(f"null labels {name!r} contain non-finite values")
+    labels.setflags(write=False)
+    return labels
+
+
 @dataclass(frozen=True)
 class CVResult:
     r2_per_fold: np.ndarray
@@ -75,7 +143,14 @@ class CVResult:
 
 @dataclass(frozen=True)
 class PermutationTestResult:
-    """Frozen-parameter shift test on common non-wrapping trial support."""
+    """Frozen-parameter permutation test.
+
+    With ``method="shift"``, ``shifts`` are trial lags on the common
+    non-wrapping support. With ``method="labels"``, ``shifts`` are label
+    indices: 0 is the observed alignment and ``k`` is null label ``k - 1``,
+    scored on every eligible trial. Either way the first entry is observed and
+    ``p_value`` is ``(1 + #{null >= observed}) / (1 + n_null)``.
+    """
 
     kind: str
     shifts: np.ndarray
@@ -86,6 +161,7 @@ class PermutationTestResult:
     reduced_r2_per_fold: np.ndarray
     reduced_r2_pooled: float
     reduced_diagnostics_per_fold: tuple[ConvergenceDiagnostics, ...]
+    method: str = "shift"
 
     @property
     def delta_r2_per_shift(self) -> np.ndarray:
@@ -170,19 +246,27 @@ class EvaluationResult:
         ) -> dict | None:
             if result is None:
                 return None
+            # A labels null has ~1000 entries per dropout; serialize only the
+            # pooled curve that defines the p-value (per-fold curves stay on the
+            # in-memory result).
+            compact = result.method == "labels"
             return {
                 "kind": result.kind,
-                "shifts": result.shifts.copy(),
+                "method": result.method,
+                "shifts": None if compact else result.shifts.copy(),
                 "n_unique_shifts": int(result.shifts.size),
+                "n_null": int(result.shifts.size - 1),
                 "eligible_trials": result.eligible_trials.copy(),
                 "valid_trials": result.valid_trials.copy(),
                 "omitted_trials": result.omitted_trials,
                 "p_value": result.p_value,
                 "observed_delta_r2": result.observed_delta_r2,
                 "observed_delta_r2_pooled": result.observed_delta_r2_pooled,
-                "delta_r2_per_shift": result.delta_r2_per_shift.copy(),
+                "delta_r2_per_shift": (
+                    None if compact else result.delta_r2_per_shift.copy()
+                ),
                 "delta_r2_per_shift_per_fold": (
-                    result.delta_r2_per_shift_per_fold.copy()
+                    None if compact else result.delta_r2_per_shift_per_fold.copy()
                 ),
                 "delta_r2_pooled_per_shift": (result.delta_r2_pooled_per_shift.copy()),
                 "reduced_r2_per_fold": result.reduced_r2_per_fold.copy(),
@@ -333,6 +417,7 @@ class _PermutationPlan:
     gain_name: str | None = None
     gain_terms: tuple[tuple[str, str], ...] = ()
     predictor: str | None = None
+    method: str = "shift"
 
 
 def _edge_block_shifts(values: np.ndarray) -> np.ndarray:
@@ -408,11 +493,24 @@ def _gain_terms_for_permutation(
     return gain_name, terms
 
 
+def _label_rows(
+    labels: np.ndarray,
+    active_trials: np.ndarray,
+    base: np.ndarray,
+) -> np.ndarray:
+    """Stack the observed trial values and the labels on the active trials."""
+    rows = np.tile(base, (labels.shape[0] + 1, 1))
+    rows[1:, active_trials] = labels[:, active_trials]
+    return rows
+
+
 def _permutation_plan(
     prepared: PreparedDesign,
     dropout: ResolvedDropout,
     selected: np.ndarray,
+    null: NullConfig | None = None,
 ) -> _PermutationPlan:
+    use_labels = null is not None and null.method == "labels"
     active_trials = np.unique(prepared.data.trial_index[selected])
     n_trials = prepared.data.n_trials
     if dropout.predictors:
@@ -443,6 +541,29 @@ def _permutation_plan(
                     "constant within every selected trial"
                 )
             active_values[index] = values[0]
+        if use_labels:
+            labels = null.labels_for(predictor, n_trials)
+            observed = np.unique(active_values)
+            allowed = np.isclose(
+                labels[:, active_trials][..., None], observed[None, None, :]
+            ).any(axis=-1)
+            if not allowed.all():
+                raise ValueError(
+                    f"dropout {dropout.name!r}: null labels for predictor "
+                    f"{predictor!r} must take observed predictor values "
+                    f"{observed.tolist()}"
+                )
+            base = np.zeros(n_trials)
+            base[active_trials] = active_values
+            return _PermutationPlan(
+                kind="predictor",
+                shifts=np.arange(labels.shape[0] + 1),
+                trial_values_per_shift=_label_rows(labels, active_trials, base),
+                eligible_trials=active_trials,
+                valid_trials=active_trials.copy(),
+                predictor=predictor,
+                method="labels",
+            )
         shifts = _edge_block_shifts(active_values)
         valid_trials = _common_nonwrapping_trials(active_trials, shifts)
         shifted = np.zeros((shifts.size, n_trials))
@@ -463,6 +584,18 @@ def _permutation_plan(
         prepared.data.trial_values[gain_spec.source], dtype=float
     )[:n_trials]
     active_values = source_values[active_trials]
+    if use_labels:
+        labels = null.labels_for(gain_name, n_trials)
+        return _PermutationPlan(
+            kind="gain",
+            shifts=np.arange(labels.shape[0] + 1),
+            trial_values_per_shift=_label_rows(labels, active_trials, source_values),
+            eligible_trials=active_trials,
+            valid_trials=active_trials.copy(),
+            gain_name=gain_name,
+            gain_terms=gain_terms,
+            method="labels",
+        )
     shifts = _edge_block_shifts(active_values)
     valid_trials = _common_nonwrapping_trials(active_trials, shifts)
     shifted = np.tile(source_values, (shifts.size, 1))
@@ -583,6 +716,72 @@ def _fixed_gain_shift_predictions(
     return predictions
 
 
+_BATCHED_LABEL_NULL = True
+
+
+def _batched_label_sse(
+    prepared: PreparedDesign,
+    plan: _PermutationPlan,
+    state: FitState,
+    config: FitConfig,
+    y_train: np.ndarray,
+    y_test: np.ndarray,
+    train_blocks: Mapping[str, np.ndarray],
+    test_blocks: Mapping[str, np.ndarray],
+    train_gains: Mapping[str, np.ndarray],
+    test_gains: Mapping[str, np.ndarray],
+    train_trials: np.ndarray,
+    test_trials: np.ndarray,
+) -> np.ndarray | None:
+    """Score every null label at once when the linear subproblem is Ridge.
+
+    Returns ``None`` when the per-label refits must be used instead: the shift
+    null (kept on its original code path), Lasso kernels, or a kernel penalty
+    that would have to be selected by inner CV.
+    """
+    if (
+        plan.method != "labels"
+        or not _BATCHED_LABEL_NULL
+        or config.regularizer != "ridge"
+    ):
+        return None
+    if plan.kind == "gain":
+        return gain_label_sse(
+            prepared,
+            plan.gain_terms,
+            plan.trial_values_per_shift,
+            state,
+            y_train,
+            y_test,
+            train_blocks,
+            test_blocks,
+            train_gains,
+            test_gains,
+            train_trials,
+            test_trials,
+        )
+    alpha = state.iterations[-1].kernel_alpha
+    if alpha is None:
+        alpha = config.kernel_alpha
+    if alpha is None or plan.predictor is None:
+        return None
+    return predictor_label_sse(
+        prepared,
+        plan.predictor,
+        plan.trial_values_per_shift,
+        state,
+        alpha,
+        y_train,
+        y_test,
+        train_blocks,
+        test_blocks,
+        train_gains,
+        test_gains,
+        train_trials,
+        test_trials,
+    )
+
+
 def evaluate(
     prepared: PreparedDesign,
     y: np.ndarray,
@@ -591,8 +790,12 @@ def evaluate(
     cv: CVConfig | None = None,
     dropouts: Sequence[Dropout] | None = None,
     mask: np.ndarray | None = None,
+    null: NullConfig | None = None,
 ) -> EvaluationResult:
-    """Fit once and evaluate all requested dropouts in one shared CV pass."""
+    """Fit once and evaluate all requested dropouts in one shared CV pass.
+
+    ``null`` selects the permutation-test null (default: linear shifts).
+    """
     values = np.asarray(y, dtype=float).ravel()
     if values.size != prepared.data.n_time:
         raise ValueError(
@@ -610,7 +813,7 @@ def evaluate(
         raise ValueError("dropout names must be unique")
     resolved = tuple(dropout.resolve(prepared) for dropout in requests)
     permutation_plans = {
-        dropout.name: _permutation_plan(prepared, dropout, selected)
+        dropout.name: _permutation_plan(prepared, dropout, selected, null)
         for dropout in resolved
         if dropout.permutation_test
     }
@@ -842,6 +1045,34 @@ def evaluate(
                 np.sum((permutation_target - permutation_reduced_prediction) ** 2)
             )
 
+            label_sse = _batched_label_sse(
+                prepared,
+                plan,
+                permutation_state,
+                fit_config,
+                values[permutation_train_rows],
+                permutation_target,
+                permutation_train_blocks,
+                permutation_test_blocks,
+                permutation_train_gains,
+                permutation_test_gains,
+                permutation_train_trials,
+                permutation_test_trials,
+            )
+            if label_sse is not None:
+                total = float(
+                    np.sum((permutation_target - permutation_target.mean()) ** 2)
+                )
+                shifted_r2 = (
+                    1 - label_sse / total
+                    if total > 0
+                    else np.full(label_sse.size, np.nan)
+                )
+                permutation_delta_r2[dropout.name].append(
+                    shifted_r2 - fold_permutation_reduced_r2
+                )
+                permutation_shifted_squared_error[dropout.name] += label_sse
+                continue
             if plan.kind == "gain":
                 shifted_predictions = _fixed_kernel_shift_predictions(
                     prepared,
@@ -916,6 +1147,7 @@ def evaluate(
             reduced_r2_per_fold=np.asarray(permutation_reduced_r2[name], dtype=float),
             reduced_r2_pooled=permutation_reduced_pooled,
             reduced_diagnostics_per_fold=tuple(permutation_reduced_diagnostics[name]),
+            method=plan.method,
         )
 
     dropout_results = {

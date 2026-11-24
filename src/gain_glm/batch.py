@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+import zlib
 from collections.abc import Sequence
 from dataclasses import replace as dataclass_replace
 from pathlib import Path
@@ -24,8 +25,9 @@ from .dynamic_routing import (
     load_unit_target,
     prepare,
     qc_unit_ids,
+    random_block_null,
 )
-from .evaluation import CVConfig
+from .evaluation import CVConfig, NullConfig
 from .model import Dropout, FitConfig, ModelSpec
 
 
@@ -44,9 +46,10 @@ def _evaluate_unit(
     fit: FitConfig,
     cv: CVConfig,
     dropouts: Sequence[Dropout],
+    null: NullConfig | None = None,
 ) -> tuple[str, dict]:
     with threadpool_limits(1):
-        result = prepared.evaluate(y, fit=fit, cv=cv, dropouts=dropouts)
+        result = prepared.evaluate(y, fit=fit, cv=cv, dropouts=dropouts, null=null)
     return unit_id, result.to_dict()
 
 
@@ -65,8 +68,20 @@ def fit_session(
     qc_filter: pl.Expr | str | None = None,
     use_instruction_trials: bool = False,
     overwrite: bool = False,
+    null: str = "shift",
+    n_null: int = 1000,
+    min_block_duration: float = 300.0,
+    null_seed: int | None = None,
 ) -> Path:
-    """Fit selected units, using ``qc_filter`` in place of ``qc_column`` if given."""
+    """Fit selected units, using ``qc_filter`` in place of ``qc_column`` if given.
+
+    ``null="random-blocks"`` tests permutation dropouts against ``n_null``
+    pseudo-contexts with random block boundaries (every block at least
+    ``min_block_duration`` s), shared by all units of the session. The seed
+    defaults to a hash of ``session_id`` so reruns reproduce the labels.
+    """
+    if null not in NULL_CHOICES:
+        raise ValueError(f"null must be one of {NULL_CHOICES}")
     output_path = Path(output_dir) / f"{session_id}.json"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists() and not overwrite:
@@ -83,13 +98,32 @@ def fit_session(
         use_instruction_trials=use_instruction_trials,
     )
     prepared = prepare(session, model)
+    null_info: dict[str, Any] = {"method": "shift"}
+    null_config = None
+    if null == "random-blocks":
+        seed = zlib.crc32(session_id.encode()) if null_seed is None else null_seed
+        null_config = random_block_null(
+            session, n_null, min_block_duration=min_block_duration, seed=seed
+        )
+        null_info = {
+            "method": "random-blocks",
+            "n_null": n_null,
+            "min_block_duration": min_block_duration,
+            "seed": seed,
+        }
     targets = {unit: load_unit_target(session, unit) for unit in units}
     fit_config = FitConfig() if fit is None else fit
     cv_config = CVConfig() if cv is None else cv
     dropout_requests = model.dropouts if dropouts is None else tuple(dropouts)
     results = Parallel(n_jobs=n_jobs, prefer="processes")(
         delayed(_evaluate_unit)(
-            unit, targets[unit], prepared, fit_config, cv_config, dropout_requests
+            unit,
+            targets[unit],
+            prepared,
+            fit_config,
+            cv_config,
+            dropout_requests,
+            null_config,
         )
         for unit in units
     )
@@ -100,6 +134,7 @@ def fit_session(
         "fit_window": model.fit_window,
         "fit_events": model.fit_events,
         "use_instruction_trials": use_instruction_trials,
+        "null": null_info,
         "runtime_seconds": time.perf_counter() - started,
         "units": dict(results),
     }
@@ -183,6 +218,39 @@ def compare_models(
                     row[f"permutation_p_{name}"] = dropout.permutation.p_value
             rows.append(row)
     return pl.DataFrame(rows)
+
+
+NULL_CHOICES = ("shift", "random-blocks")
+
+
+def add_null_arguments(parser: argparse.ArgumentParser) -> None:
+    """Expose the permutation-test null options on each workflow CLI."""
+    parser.add_argument(
+        "--null",
+        choices=NULL_CHOICES,
+        default="shift",
+        help=(
+            "Permutation-test null: linear trial shifts (default) or pseudo-"
+            "contexts with randomly placed block boundaries"
+        ),
+    )
+    parser.add_argument(
+        "--n-null",
+        type=int,
+        default=1000,
+        help="Number of random-block pseudo-contexts (default: 1000)",
+    )
+    parser.add_argument(
+        "--min-block-duration",
+        type=parse_positive_float,
+        default=300.0,
+        help="Minimum random-block duration in seconds (default: 300)",
+    )
+    parser.add_argument(
+        "--null-seed",
+        type=int,
+        help="Random-block seed (default: hash of the session id)",
+    )
 
 
 def parse_dropout(value: str) -> Dropout:
@@ -278,6 +346,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--n-jobs", type=int, default=-1)
     parser.add_argument("--limit", type=int)
     add_qc_arguments(parser)
+    add_null_arguments(parser)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args(argv)
     model = MODELS[args.model]
@@ -301,6 +370,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         qc_filter=args.qc_filter,
         use_instruction_trials=args.use_instruction_trials,
         overwrite=args.overwrite,
+        null=args.null,
+        n_null=args.n_null,
+        min_block_duration=args.min_block_duration,
+        null_seed=args.null_seed,
     )
 
 
