@@ -17,7 +17,7 @@ from dr_datacube import datacube_config, get_session_ids_from_github, list_nwb_s
 from simple_slurm import Slurm
 
 from gain_glm import FitConfig
-from gain_glm.batch import add_qc_arguments, parse_positive_float
+from gain_glm.batch import add_null_arguments, add_qc_arguments, parse_positive_float
 from gain_glm.dynamic_routing import MODELS, QC_COLUMN
 
 REPO_DIR = Path(__file__).resolve().parents[1]
@@ -95,6 +95,10 @@ def fit_command(
     qc_filter: str | None = None,
     use_instruction_trials: bool = False,
     overwrite: bool = False,
+    null: str = "shift",
+    n_null: int = 1000,
+    min_block_duration: float = 300.0,
+    null_seed: int | None = None,
 ) -> str:
     """Build the batch-fitting command run inside one SLURM job."""
     command = (
@@ -119,6 +123,13 @@ def fit_command(
         command += f" --qc-column {shlex.quote(qc_column)}"
     if use_instruction_trials:
         command += " --use-instruction-trials"
+    if null != "shift":
+        command += (
+            f" --null {null} --n-null {n_null}"
+            f" --min-block-duration {min_block_duration}"
+        )
+        if null_seed is not None:
+            command += f" --null-seed {null_seed}"
     if overwrite:
         command += " --overwrite"
     return command
@@ -150,6 +161,7 @@ def main() -> None:
     parser.add_argument("--limit", type=int)
     parser.add_argument("--unit-limit", type=int)
     add_qc_arguments(parser)
+    add_null_arguments(parser)
     parser.add_argument("--model", choices=MODELS, default="default")
     parser.add_argument(
         "--cv-split",
@@ -204,6 +216,10 @@ def main() -> None:
             qc_filter=args.qc_filter,
             use_instruction_trials=args.use_instruction_trials,
             overwrite=args.overwrite,
+            null=args.null,
+            n_null=args.n_null,
+            min_block_duration=args.min_block_duration,
+            null_seed=args.null_seed,
         )
         job = slurm_job(row["session_id"])
         if args.dry_run:

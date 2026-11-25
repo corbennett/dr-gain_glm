@@ -19,6 +19,7 @@ from .data import (
     _window_bin_bounds,
 )
 from .design import PreparedDesign, _bin_rows, compile_design
+from .evaluation import NullConfig
 from .model import Dropout, Event, Gain, ModelSpec, Signal
 
 lazynwb.config.anon = True
@@ -477,6 +478,101 @@ def _context_block_index(context: np.ndarray) -> np.ndarray:
     blocks = np.zeros(values.size, dtype=int)
     blocks[1:] = np.cumsum(values[1:] != values[:-1])
     return blocks
+
+
+def _trial_start_times(session: SessionData) -> np.ndarray:
+    """Return the first model-bin start of every indexed trial (absolute time)."""
+    trial_index = session.data.trial_index
+    starts = np.full(session.data.n_trials, np.inf)
+    np.minimum.at(starts, trial_index, session.bin_starts)
+    if not np.all(np.isfinite(starts)):
+        raise ValueError("every trial needs at least one model bin")
+    return starts
+
+
+def _random_block_durations(
+    total: float,
+    n_blocks: int,
+    min_block_duration: float,
+    n_labels: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Draw block durations uniformly from all splits with every block >= minimum."""
+    slack = total - n_blocks * min_block_duration
+    if slack <= 0:
+        raise ValueError(
+            f"task lasts {total:.0f} s, too short for {n_blocks} blocks of at "
+            f"least {min_block_duration:.0f} s"
+        )
+    return min_block_duration + slack * rng.dirichlet(np.ones(n_blocks), size=n_labels)
+
+
+def random_block_contexts(
+    session: SessionData,
+    n_labels: int = 1000,
+    *,
+    min_block_duration: float = 300.0,
+    n_blocks: int | None = None,
+    seed: int | None = None,
+) -> np.ndarray:
+    """Return pseudo-contexts with randomly placed block boundaries.
+
+    Each row alternates +1/-1 over ``n_blocks`` blocks (default: the observed
+    number of context blocks among included trials), starting with a random
+    sign. Block durations are drawn uniformly from all ways of splitting the
+    task into ``n_blocks`` blocks that each last at least
+    ``min_block_duration`` seconds. Trials are assigned by start time. The
+    result has shape ``(n_labels, n_trials)`` and is meant for
+    ``NullConfig(method="labels", labels=...)``; the same labels should be
+    used for every unit of a session.
+    """
+    if n_labels < 1:
+        raise ValueError("n_labels must be at least one")
+    if not np.isfinite(min_block_duration) or min_block_duration <= 0:
+        raise ValueError("min_block_duration must be a finite positive number")
+    if n_blocks is None:
+        if "trial_context" not in session.data.trial_values:
+            raise ValueError("n_blocks is required when trial_context is not loaded")
+        context = np.asarray(session.data.trial_values["trial_context"])
+        blocks = _context_block_index(context[session.included_trial_mask])
+        n_blocks = int(blocks[-1]) + 1
+    if n_blocks < 2:
+        raise ValueError("random block contexts require at least two blocks")
+    rng = np.random.default_rng(seed)
+    durations = _random_block_durations(
+        session.task_end_time - session.task_start_time,
+        n_blocks,
+        min_block_duration,
+        n_labels,
+        rng,
+    )
+    boundaries = session.task_start_time + np.cumsum(durations[:, :-1], axis=1)
+    starts = _trial_start_times(session)
+    block = (starts[None, :, None] >= boundaries[:, None, :]).sum(axis=2)
+    first_sign = np.where(rng.random(n_labels) < 0.5, 1.0, -1.0)
+    return np.where(block % 2 == 0, 1.0, -1.0) * first_sign[:, None]
+
+
+def random_block_null(
+    session: SessionData,
+    n_labels: int = 1000,
+    *,
+    min_block_duration: float = 300.0,
+    n_blocks: int | None = None,
+    seed: int | None = None,
+) -> NullConfig:
+    """Return a :class:`NullConfig` that tests context dropouts against
+    :func:`random_block_contexts`."""
+    return NullConfig(
+        method="labels",
+        labels=random_block_contexts(
+            session,
+            n_labels,
+            min_block_duration=min_block_duration,
+            n_blocks=n_blocks,
+            seed=seed,
+        ),
+    )
 
 
 def _pose_signal(

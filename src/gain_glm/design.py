@@ -12,7 +12,7 @@ from .data import ModelData, TimedSignal, _window_bin_bounds, windows_mask
 from .model import Event, FitConfig, FittedModel, History, ModelSpec, Signal
 
 if TYPE_CHECKING:
-    from .evaluation import CVConfig, EvaluationResult
+    from .evaluation import CVConfig, EvaluationResult, NullConfig
     from .model import Dropout
 
 
@@ -345,10 +345,13 @@ class PreparedDesign:
         cv: CVConfig | None = None,
         dropouts: Sequence[Dropout] | None = None,
         mask: np.ndarray | None = None,
+        null: NullConfig | None = None,
     ) -> EvaluationResult:
         from .evaluation import evaluate
 
-        return evaluate(self, y, fit=fit, cv=cv, dropouts=dropouts, mask=mask)
+        return evaluate(
+            self, y, fit=fit, cv=cv, dropouts=dropouts, mask=mask, null=null
+        )
 
 
 def _parameter_layout(
